@@ -250,5 +250,5 @@ the same manner as its `check_gpwbpdu.pl`.
 
 BSD-3-Clause. See [LICENSE](LICENSE).
 
-* Copyright (c) 2022 Ginzado Co., Ltd.
-* Copyright (c) 2026 Taisuke "paina" SATO
+* Copyright (c) 2022, Ginzado Co., Ltd.
+* Copyright (c) 2026, Taisuke "paina" SATO
