@@ -121,7 +121,7 @@ Requirements:
 On Ubuntu 26.04:
 
 ```
-$ sudo apt install build-essential meson pkg-config libdpdk-dev
+$ sudo apt install build-essential meson pkg-config dpdk libdpdk-dev
 $ meson setup build
 $ meson compile -C build
 ```
@@ -144,13 +144,13 @@ $ cc $(pkg-config --cflags libdpdk) -DALLOW_EXPERIMENTAL_API \
 Set up hugepages and bind the NICs, as for any DPDK application:
 
 ```
-# mkdir /dev/hugepages # if needed
-# echo 64 > /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages
-# modprobe uio_pci_generic
-$ sudo dpdk-devbind.py -u 0000:03:00.0
-$ sudo dpdk-devbind.py -u 0000:0b:00.0
-$ sudo dpdk-devbind.py -b uio_pci_generic 0000:03:00.0
-$ sudo dpdk-devbind.py -b uio_pci_generic 0000:0b:00.0
+% sudo mkdir /dev/hugepages # if needed
+% sudo sh -c 'echo 64 > /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages'
+% sudo modprobe uio_pci_generic
+% sudo dpdk-devbind.py -u 0000:01:00.0
+% sudo dpdk-devbind.py -u 0000:01:00.1
+% sudo dpdk-devbind.py -b uio_pci_generic 0000:01:00.0
+% sudo dpdk-devbind.py -b uio_pci_generic 0000:01:00.1
 ```
 
 Two ports are required: port 0 is the DL side (raw Ethernet frames) and
@@ -174,7 +174,7 @@ EtherIP over IPv6:
 
 ```
 ip6                               # mode
-2001:db8::2                       # dstaddr (peer address)
+3ffe::1                           # dstaddr (peer address)
 2001:db8::1                       # srcaddr (local address)
 ```
 
@@ -185,7 +185,7 @@ Optional settings:
 
 ```
 mtu 1500                          # UL-side MTU (ip4: 576-1500, ip6: 1280-1500)
-dstmac 00:0c:29:79:48:9d          # static next-hop MAC address
+dstmac 00:1a:2b:3c:4d:5e          # static next-hop MAC address
 stats /run/pestats.socket         # statistics socket path (read at startup only)
 ```
 
