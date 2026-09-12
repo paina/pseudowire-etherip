@@ -75,10 +75,18 @@ before decapsulation.
 
 When passing an inner MTU of 1500 (1514-byte frames) through an outer
 MTU of 1500, every full-sized frame is split in two. If the outer path
-can carry jumbo frames, raising the MTU of the underlying network is
-preferable; but where the path MTU cannot be changed (e.g. the
-"IPv6 folded-back" connectivity within the NTT FLET'S network in Japan),
-fragmentation lets such frames through as-is.
+can carry jumbo frames, raising `--mtu` so that nothing is fragmented
+is preferable: 1536 (IPv4) or 1556 (IPv6) is enough for 1514-byte
+inner frames, 4 more with a VLAN tag, and up to 9000 is accepted. But
+where the path MTU cannot be changed (e.g. the "IPv6 folded-back"
+connectivity within the NTT FLET'S network in Japan), fragmentation
+lets such frames through as-is.
+
+The UL port is configured with `--mtu` as its MTU, so the NIC and its
+PMD must support that size (and, above what fits in one 2048-byte mbuf,
+scattered receive). The DL port keeps the standard MTU of 1500, which
+bounds the inner frame size as before; larger inner frames are not
+accepted on the DL side.
 
 Reassembly has the following constraints (from `librte_ip_frag` and this
 implementation):
@@ -167,7 +175,7 @@ Application options follow the EAL options and `--`:
 |:----------------------|:-------------------------------------------------------------------|
 | `--remote=ADDR`       | IP address of the remote tunnel endpoint (required)                |
 | `--local=ADDR`        | IP address of the local tunnel endpoint (required)                 |
-| `--mtu=N`             | UL-side MTU (IPv4: 576-1500, IPv6: 1280-1500; default 1500)        |
+| `--mtu=N`             | UL-side MTU (IPv4: 576-9000, IPv6: 1280-9000; default 1500)        |
 | `--nexthop-mac=MAC`   | Static next-hop MAC address (resolved with ARP or NDP when omitted) |
 | `--stats-socket=PATH` | Statistics socket path (default `/run/pestats.socket`)             |
 | `--ul-port=PORT`      | Port used as the UL side                                           |

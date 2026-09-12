@@ -65,11 +65,13 @@
 
 #define PE_PROTO_ICMP6 58
 
-/* Default and permitted range of the UL side MTU. */
+/* Default and permitted range of the UL side MTU (up to the usual jumbo frame size). */
 #define PE_DEFAULT_MTU 1500
 #define PE_MIN_MTU_IP4 576
 #define PE_MIN_MTU_IP6 1280
-#define PE_MAX_MTU 1500
+#define PE_MAX_MTU 9000
+/* The DL port keeps the standard MTU, which bounds the size of the inner frames. */
+#define PE_DL_MTU RTE_ETHER_MTU
 
 /* Maximum number of fragments produced when encapsulating. */
 #define PE_ENCAP_MAX_FRAGS RTE_LIBRTE_IP_FRAG_MAX_FRAG
@@ -685,8 +687,12 @@ send_ndp_rs(void)
 		rte_pktmbuf_free(rs_buf);
 }
 
+/*
+ * Configure and start a port with the given MTU: one RX queue, two TX queues
+ * (queue 1 is used by lcore_main for ARP/NDP), promiscuous mode.
+ */
 static inline int
-port_init(uint16_t port)
+port_init(uint16_t port, uint16_t mtu)
 {
 	struct rte_eth_conf port_conf;
 	const uint16_t rx_rings = 1, tx_rings = 2;
@@ -708,6 +714,25 @@ port_init(uint16_t port)
 		return retval;
 	}
 
+	/* The port must accept packets of the given MTU. */
+	if (mtu > dev_info.max_mtu) {
+		printf("Error: port %u supports an MTU of at most %u, %u requested\n",
+				port, dev_info.max_mtu, mtu);
+		return -1;
+	}
+	port_conf.rxmode.mtu = mtu;
+	/*
+	 * Packets larger than an mbuf have to be received scattered over several
+	 * mbufs, which the data path handles (reassembled packets are like that
+	 * anyway). Request it when the PMD advertises the offload; PMDs that do not
+	 * either scatter on their own (net_pcap) or reject the MTU when configured.
+	 * The overhead allows for two VLAN tags, as the most demanding PMDs do.
+	 */
+	if (mtu + RTE_ETHER_HDR_LEN + RTE_ETHER_CRC_LEN + 2 * RTE_VLAN_HLEN
+			> rte_pktmbuf_data_room_size(mbuf_pool) - RTE_PKTMBUF_HEADROOM
+			&& (dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_SCATTER))
+		port_conf.rxmode.offloads |= RTE_ETH_RX_OFFLOAD_SCATTER;
+
 	if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
 		port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
 	/* Reassembled packets are multi-segment, so enable this offload when supported. */
@@ -715,8 +740,11 @@ port_init(uint16_t port)
 		port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MULTI_SEGS;
 
 	retval = rte_eth_dev_configure(port, rx_rings, tx_rings, &port_conf);
-	if (retval != 0)
+	if (retval != 0) {
+		printf("Error during configuring device (port %u, MTU %u): %s\n",
+				port, mtu, strerror(-retval));
 		return retval;
+	}
 
 	retval = rte_eth_dev_adjust_nb_rx_tx_desc(port, &nb_rxd, &nb_txd);
 	if (retval != 0)
@@ -1665,9 +1693,9 @@ main(int argc, char *argv[])
 	if (frag_tbl == NULL)
 		rte_exit(EXIT_FAILURE, "Cannot create fragment reassembly table\n");
 
-	if (port_init(port_dl) != 0)
+	if (port_init(port_dl, PE_DL_MTU) != 0)
 		rte_exit(EXIT_FAILURE, "Cannot init DL port %"PRIu16 "\n", port_dl);
-	if (port_init(port_ul) != 0)
+	if (port_init(port_ul, outer_mtu) != 0)
 		rte_exit(EXIT_FAILURE, "Cannot init UL port %"PRIu16 "\n", port_ul);
 
 	if (rte_eth_dev_get_name_by_port(port_ul, name_ul) != 0)
