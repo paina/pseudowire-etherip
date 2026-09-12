@@ -153,8 +153,10 @@ Set up hugepages and bind the NICs, as for any DPDK application:
 % sudo dpdk-devbind.py -b uio_pci_generic 0000:01:00.1
 ```
 
-Two ports are required: port 0 is the DL side (raw Ethernet frames) and
-port 1 is the UL side (EtherIP packets).
+The application uses two ports: the DL side (raw Ethernet frames) and
+the UL side (EtherIP packets). Which port plays which role is chosen
+with `--dl-port` / `--ul-port` (see [Running](#running)); by default the
+first port is the DL side and the second is the UL side.
 
 ### Configuration file
 
@@ -193,6 +195,33 @@ stats /run/pestats.socket         # statistics socket path (read at startup only
 
 ```
 $ sudo ./dpdk-pseudowire-etherip -l 1-3 -- --config path/to/config
+```
+
+Application options (after `--`):
+
+| Option           | Meaning                       |
+|:-----------------|:------------------------------|
+| `--config=FILE`  | Configuration file (required) |
+| `--ul-port=PORT` | Port used as the UL side      |
+| `--dl-port=PORT` | Port used as the DL side      |
+
+`PORT` is a DPDK port ID or a device name: a PCI address
+(`0000:01:00.1`, or the shorter `01:00.1`) or a vdev name (`net_pcap1`).
+When neither option is given, exactly two ports must be available; the
+first is the DL side and the second is the UL side. When only one is
+given, the other side is the remaining one of the two ports. When both
+are given, those two ports are used and any other port is left
+untouched. For example, to swap the roles of the two ports:
+
+```
+$ sudo ./dpdk-pseudowire-etherip -l 1-3 -- --config path/to/config --ul-port 0000:01:00.0
+```
+
+The ports actually chosen are printed at startup:
+
+```
+Port UL: 0 (0000:01:00.0) MAC: ...
+Port DL: 1 (0000:01:00.1) MAC: ...
 ```
 
 Like ginzado-pseudowire, the application uses three lcores:
