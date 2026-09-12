@@ -5,13 +5,13 @@ tunnels, over either IPv4 or IPv6.
 
 It is derived from ginzado-pseudowire
 (<https://github.com/ginzado/dpdk>), replacing its proprietary
-encapsulation with standard EtherIP (IP protocol number 97). The peer
-therefore does not have to be this application: any implementation that
-speaks EtherIP (the gif/etherip interfaces of BSD-derived operating
+encapsulation with standard EtherIP (IP protocol number 97). The remote
+end therefore does not have to be this application: any implementation
+that speaks EtherIP (the gif/etherip interfaces of BSD-derived operating
 systems, router products from various vendors, ...) will interoperate.
 
-* EtherIP over IPv4 (`ip4` mode)
-* EtherIP over IPv6 (`ip6` mode)
+* EtherIP over IPv4
+* EtherIP over IPv6
 
 The application uses two ports. Frames received on the DL (downlink)
 port are encapsulated in EtherIP and sent out of the UL (uplink) port;
@@ -26,15 +26,17 @@ the DL port.
 
 ## Differences from ginzado-pseudowire
 
-* The encapsulation is standard EtherIP (RFC 3378), so the peer can be
-  any EtherIP implementation.
+* The encapsulation is standard EtherIP (RFC 3378), so the remote end
+  can be any EtherIP implementation.
 * Oversized packets are split with standard IP fragmentation (IPv4
   fragments / the IPv6 fragment extension header) instead of a
   proprietary format. Fragmentation and reassembly use DPDK's
   `librte_ip_frag`.
 * Tunnels can be built over IPv4 as well as IPv6.
 * The next-hop MAC address can be resolved automatically with ARP
-  (`ip4`) or NDP (`ip6`), or specified statically in the configuration.
+  (IPv4) or NDP (IPv6), or given statically on the command line.
+* All settings are given on the command line; there is no
+  configuration file and no SIGHUP reload.
 
 ## Encapsulation
 
@@ -67,14 +69,13 @@ required by RFC 3378).
 
 ## Fragmentation and MTU
 
-If an encapsulated packet exceeds the UL-side MTU (configuration key
-`mtu`, default 1500), it is split with standard IP fragmentation before
-transmission. Fragmented packets received on the UL side are reassembled
+If an encapsulated packet exceeds the UL-side MTU (`--mtu`, default
+1500), it is split with standard IP fragmentation before transmission. Fragmented packets received on the UL side are reassembled
 before decapsulation.
 
 When passing an inner MTU of 1500 (1514-byte frames) through an outer
 MTU of 1500, every full-sized frame is split in two. If the outer path
-can carry jumbo frames, raising the MTU on the peer network is
+can carry jumbo frames, raising the MTU of the underlying network is
 preferable; but where the path MTU cannot be changed (e.g. the
 "IPv6 folded-back" connectivity within the NTT FLET'S network in Japan),
 fragmentation lets such frames through as-is.
@@ -96,18 +97,18 @@ The destination of encapsulated packets (the destination MAC address of
 the outer Ethernet header) is determined by one of the following. Frames
 received on the DL side are discarded until it is resolved.
 
-* If `dstmac` is set in the configuration, that value is always used.
-* `ip4` mode: an ARP request for the peer address is sent every second
-  and the answer is learned. ARP requests for the local address are
-  answered. (This assumes the peer is on-link; if it is off-link,
-  specify the gateway's MAC address with `dstmac`.)
-* `ip6` mode: an NS and an RS for the peer address are sent every
-  second and NAs are learned (when the peer is on-link). As in
+* If `--nexthop-mac` is given, that value is always used.
+* IPv4: an ARP request for the remote address is sent every second and
+  the answer is learned. ARP requests for the local address are
+  answered. (This assumes the remote end is on-link; if it is off-link,
+  specify the gateway's MAC address with `--nexthop-mac`.)
+* IPv6: an NS and an RS for the remote address are sent every second
+  and NAs are learned (when the remote end is on-link). As in
   ginzado-pseudowire, when an RA advertising the same prefix as the
   local address is received, the MAC address of its sender (the router)
   is learned (for cases like the NTT FLET'S folded-back connectivity
-  where the peer is behind a router). NSes for the local address are
-  answered with an NA.
+  where the remote end is behind a router). NSes for the local address
+  are answered with an NA.
 
 ## Building
 
@@ -155,71 +156,67 @@ Set up hugepages and bind the NICs, as for any DPDK application:
 
 The application uses two ports: the DL side (raw Ethernet frames) and
 the UL side (EtherIP packets). Which port plays which role is chosen
-with `--dl-port` / `--ul-port` (see [Running](#running)); by default the
+with `--dl-port` / `--ul-port` (see [Options](#options)); by default the
 first port is the DL side and the second is the UL side.
 
-### Configuration file
+### Options
 
-Lines 1-3 are, in order, the mode, the peer address (`dstaddr`) and the
-local address (`srcaddr`). Lines 4 onward are optional `key value`
-settings in any order. Everything after `#` is a comment.
+Application options follow the EAL options and `--`:
+
+| Option                | Meaning                                                            |
+|:----------------------|:-------------------------------------------------------------------|
+| `--remote=ADDR`       | IP address of the remote tunnel endpoint (required)                |
+| `--local=ADDR`        | IP address of the local tunnel endpoint (required)                 |
+| `--mtu=N`             | UL-side MTU (IPv4: 576-1500, IPv6: 1280-1500; default 1500)        |
+| `--nexthop-mac=MAC`   | Static next-hop MAC address (resolved with ARP or NDP when omitted) |
+| `--stats-socket=PATH` | Statistics socket path (default `/run/pestats.socket`)             |
+| `--ul-port=PORT`      | Port used as the UL side                                           |
+| `--dl-port=PORT`      | Port used as the DL side                                           |
+| `--help`              | Print the usage and exit                                           |
+
+`--remote` and `--local` are the tunnel endpoint addresses: the
+destination and source addresses of the outer IP header of the packets
+this side sends (the remote end is the "remote EtherIP station" of
+RFC 3378). Both must be IPv4 or both IPv6, which selects EtherIP over
+IPv4 or over IPv6. As in ginzado-pseudowire, they may also be written
+as plain hex strings without separators (8 digits for IPv4, 32 for
+IPv6).
+
+`PORT` is a DPDK port ID or a device name: a PCI address
+(`0000:01:00.1`, or the shorter `01:00.1`) or a vdev name (`net_pcap1`).
+When neither port option is given, exactly two ports must be available;
+the first is the DL side and the second is the UL side. When only one is
+given, the other side is the remaining one of the two ports. When both
+are given, those two ports are used and any other port is left
+untouched.
+
+### Running
 
 EtherIP over IPv4:
 
 ```
-ip4           # mode
-192.0.2.2     # dstaddr (peer address)
-192.0.2.1     # srcaddr (local address)
+$ sudo ./dpdk-pseudowire-etherip -l 1-3 -- --remote 192.0.2.2 --local 192.0.2.1
 ```
 
-EtherIP over IPv6:
+EtherIP over IPv6, with a static next hop and the roles of the two
+ports swapped:
 
 ```
-ip6                               # mode
-3ffe::1                           # dstaddr (peer address)
-2001:db8::1                       # srcaddr (local address)
+$ sudo ./dpdk-pseudowire-etherip -l 1-3 -- --remote 3ffe::1 --local 2001:db8::1 \
+	--nexthop-mac 00:1a:2b:3c:4d:5e --ul-port 0000:01:00.0
 ```
 
-As in ginzado-pseudowire, addresses may also be written as plain hex
-strings without separators (8 characters for IPv4, 32 for IPv6).
-
-Optional settings:
+The settings in effect and the ports actually chosen are printed at
+startup:
 
 ```
-mtu 1500                          # UL-side MTU (ip4: 576-1500, ip6: 1280-1500)
-dstmac 00:1a:2b:3c:4d:5e          # static next-hop MAC address
-stats /run/pestats.socket         # statistics socket path (read at startup only)
-```
-
-### Running
-
-```
-$ sudo ./dpdk-pseudowire-etherip -l 1-3 -- --config path/to/config
-```
-
-Application options (after `--`):
-
-| Option           | Meaning                       |
-|:-----------------|:------------------------------|
-| `--config=FILE`  | Configuration file (required) |
-| `--ul-port=PORT` | Port used as the UL side      |
-| `--dl-port=PORT` | Port used as the DL side      |
-
-`PORT` is a DPDK port ID or a device name: a PCI address
-(`0000:01:00.1`, or the shorter `01:00.1`) or a vdev name (`net_pcap1`).
-When neither option is given, exactly two ports must be available; the
-first is the DL side and the second is the UL side. When only one is
-given, the other side is the remaining one of the two ports. When both
-are given, those two ports are used and any other port is left
-untouched. For example, to swap the roles of the two ports:
-
-```
-$ sudo ./dpdk-pseudowire-etherip -l 1-3 -- --config path/to/config --ul-port 0000:01:00.0
-```
-
-The ports actually chosen are printed at startup:
-
-```
+mode: EtherIP over IPv6
+remote: 3ffe::1
+local: 2001:db8::1
+mtu: 1500
+nexthop-mac: 00:1A:2B:3C:4D:5E
+stats-socket: /run/pestats.socket
+...
 Port UL: 0 (0000:01:00.0) MAC: ...
 Port DL: 1 (0000:01:00.1) MAC: ...
 ```
@@ -231,15 +228,17 @@ Like ginzado-pseudowire, the application uses three lcores:
 * a loop handling everything else — frames to discard, ARP/NDP and so
   on (`lcore_main`)
 
-Sending SIGHUP makes the application reload the configuration file.
+The settings cannot be changed while running; restart the application
+instead.
 
 ### Statistics
 
 The `pestats` command reads statistics from the running application
-through a UNIX-domain socket:
+through the UNIX-domain socket selected with `--stats-socket`; a
+non-default path is given as its argument:
 
 ```
-$ sudo ./pestats
+$ sudo ./pestats [/path/to/pestats.socket]
 pestats.ul_rx_packets                 27811573
 ...
 ```
@@ -265,9 +264,9 @@ the same manner as its `check_gpwbpdu.pl`.
 
 ## Limitations and caveats
 
-* Only a single peer is supported (packets whose source/destination IP
-  addresses do not match the configuration are not treated as tunnel
-  packets).
+* Only a single remote endpoint is supported (packets whose source and
+  destination IP addresses do not match `--remote` and `--local` are
+  not treated as tunnel packets).
 * EtherIP has no keepalive or authentication mechanism. If needed,
   substitute something like monitoring the BPDU counters. There is no
   payload checksum either, so error detection relies on the Ethernet

@@ -11,7 +11,7 @@
  * - EtherIP packets received on the UL port are decapsulated and sent out the DL port.
  * - Encapsulated packets exceeding the UL MTU are split with standard IP fragmentation,
  *   and fragmented packets received on the UL port are reassembled, both using
- *   librte_ip_frag. The peer therefore does not have to be this application: any
+ *   librte_ip_frag. The remote end therefore does not have to be this application: any
  *   implementation that speaks EtherIP (BSD gif/etherip, router products, ...) will do.
  */
 
@@ -21,10 +21,8 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <getopt.h>
-#include <signal.h>
 #include <string.h>
 #include <ctype.h>
-#include <limits.h>
 
 #include <sys/time.h>
 #include <sys/un.h>
@@ -50,7 +48,12 @@
 #define NUM_MBUFS 8191
 #define MBUF_CACHE_SIZE 250
 
-#define OPTION_CONFIG "config"
+/* Application option names (those after "--"). */
+#define OPTION_REMOTE "remote"
+#define OPTION_LOCAL "local"
+#define OPTION_MTU "mtu"
+#define OPTION_NEXTHOP_MAC "nexthop-mac"
+#define OPTION_STATS_SOCKET "stats-socket"
 #define OPTION_UL_PORT "ul-port"
 #define OPTION_DL_PORT "dl-port"
 
@@ -77,7 +80,7 @@
  * (number of entries / TTL) determines the tolerance against fragment loss.
  * The table can hold up to PE_FRAG_TBL_MAX_ENTRIES * RTE_LIBRTE_IP_FRAG_MAX_FRAG
  * mbufs, so keep it small enough relative to the mbuf pool size.
- * The peer is a single node and reordering on the path is rare, so a short TTL is fine.
+ * The remote end is a single node and reordering on the path is rare, so a short TTL is fine.
  */
 #define PE_FRAG_TBL_BUCKET_NUM 2048
 #define PE_FRAG_TBL_BUCKET_ENTRIES 16
@@ -90,8 +93,6 @@ struct rte_mempool *mbuf_pool_indirect = NULL;
 
 struct rte_ip_frag_tbl *frag_tbl = NULL;
 struct rte_ip_frag_death_row death_row;
-
-char *config = NULL;
 
 unsigned lcoreid_main = LCORE_ID_ANY;
 unsigned lcoreid_ul = LCORE_ID_ANY;
@@ -115,19 +116,22 @@ struct rte_ether_addr ethaddr_dl;
 
 int pe_mode = -1;
 
-/* Peer and local tunnel IP addresses (network byte order). */
-uint8_t ip4_dstaddr[4];
-uint8_t ip4_srcaddr[4];
-struct rte_ipv6_addr ip6_dstaddr;
-struct rte_ipv6_addr ip6_srcaddr;
+/*
+ * Remote and local tunnel endpoint addresses (network byte order): the
+ * destination and source addresses of the outer IP header of packets we send.
+ */
+uint8_t ip4_remote_addr[4];
+uint8_t ip4_local_addr[4];
+struct rte_ipv6_addr ip6_remote_addr;
+struct rte_ipv6_addr ip6_local_addr;
 
 /* UL side MTU (maximum size of the outer IP packet). */
 uint16_t outer_mtu = PE_DEFAULT_MTU;
 
 /*
  * MAC address of the next hop (the destination of the outer Ethernet header).
- * Used as is when dstmac is set in the configuration file, and resolved with
- * ARP (ip4) or NDP/RA (ip6) otherwise.
+ * Used as is when given with --nexthop-mac, and resolved with ARP (IPv4) or
+ * NDP/RA (IPv6) otherwise.
  */
 struct rte_ether_addr nexthop_mac;
 int nexthop_static = false;
@@ -310,15 +314,15 @@ handle_arp(struct rte_mbuf *buf)
 	if (arp_hdr->arp_hlen != 6 || arp_hdr->arp_plen != 4)
 		return;
 
-	/* Learn the source MAC address from ARP sent by the peer (or by the next hop). */
+	/* Learn the source MAC address from ARP sent by the remote end (or by the next hop). */
 	if (!nexthop_static &&
-			memcmp(&arp_hdr->arp_data.arp_sip, ip4_dstaddr, 4) == 0)
+			memcmp(&arp_hdr->arp_data.arp_sip, ip4_remote_addr, 4) == 0)
 		update_nexthop(arp_hdr->arp_data.arp_sha.addr_bytes);
 
 	/* Reply to ARP requests for our own address. */
 	if (arp_hdr->arp_opcode != rte_cpu_to_be_16(RTE_ARP_OP_REQUEST))
 		return;
-	if (memcmp(&arp_hdr->arp_data.arp_tip, ip4_srcaddr, 4) != 0)
+	if (memcmp(&arp_hdr->arp_data.arp_tip, ip4_local_addr, 4) != 0)
 		return;
 
 	struct rte_mbuf *rep_buf = rte_pktmbuf_alloc(mbuf_pool);
@@ -340,7 +344,7 @@ handle_arp(struct rte_mbuf *buf)
 	rep_arp_hdr->arp_plen = 4;
 	rep_arp_hdr->arp_opcode = rte_cpu_to_be_16(RTE_ARP_OP_REPLY);
 	memcpy(&rep_arp_hdr->arp_data.arp_sha, &ethaddr_ul, sizeof(struct rte_ether_addr));
-	memcpy(&rep_arp_hdr->arp_data.arp_sip, ip4_srcaddr, 4);
+	memcpy(&rep_arp_hdr->arp_data.arp_sip, ip4_local_addr, 4);
 	memcpy(&rep_arp_hdr->arp_data.arp_tha, &arp_hdr->arp_data.arp_sha, sizeof(struct rte_ether_addr));
 	memcpy(&rep_arp_hdr->arp_data.arp_tip, &arp_hdr->arp_data.arp_sip, 4);
 	const uint16_t nb_tx = rte_eth_tx_burst(port_ul, 1, &rep_buf, 1);
@@ -348,7 +352,7 @@ handle_arp(struct rte_mbuf *buf)
 		rte_pktmbuf_free(rep_buf);
 }
 
-/* Send an ARP request to resolve the peer address. */
+/* Send an ARP request to resolve the remote address. */
 static void
 send_arp_request(void)
 {
@@ -371,9 +375,9 @@ send_arp_request(void)
 	arp_hdr->arp_plen = 4;
 	arp_hdr->arp_opcode = rte_cpu_to_be_16(RTE_ARP_OP_REQUEST);
 	memcpy(&arp_hdr->arp_data.arp_sha, &ethaddr_ul, sizeof(struct rte_ether_addr));
-	memcpy(&arp_hdr->arp_data.arp_sip, ip4_srcaddr, 4);
+	memcpy(&arp_hdr->arp_data.arp_sip, ip4_local_addr, 4);
 	memset(&arp_hdr->arp_data.arp_tha, 0, sizeof(struct rte_ether_addr));
-	memcpy(&arp_hdr->arp_data.arp_tip, ip4_dstaddr, 4);
+	memcpy(&arp_hdr->arp_data.arp_tip, ip4_remote_addr, 4);
 	const uint16_t nb_tx = rte_eth_tx_burst(port_ul, 1, &req_buf, 1);
 	if (unlikely(nb_tx == 0))
 		rte_pktmbuf_free(req_buf);
@@ -401,8 +405,8 @@ is_icmp6(struct rte_mbuf *buf)
 /*
  * Handle a received RA.
  * As in ginzado-pseudowire, learn the MAC address of the router advertising the same
- * prefix as our own address as the next hop (for topologies like NGN, where the peer
- * is off-link and reached through a router).
+ * prefix as our own address as the next hop (for topologies like NGN, where the remote
+ * end is off-link and reached through a router).
  */
 static void
 handle_icmp6_ra(struct rte_mbuf *buf)
@@ -433,7 +437,7 @@ handle_icmp6_ra(struct rte_mbuf *buf)
 	}
 	if (source_linkaddr == NULL || prefix_info == NULL)
 		return;
-	if (memcmp(&ip6_srcaddr, &prefix_info->prefix, 8) != 0)
+	if (memcmp(&ip6_local_addr, &prefix_info->prefix, 8) != 0)
 		return;
 	if (nexthop_static)
 		return;
@@ -470,7 +474,7 @@ handle_icmp6_ns(struct rte_mbuf *buf)
 
 	if (source_linkaddr == NULL)
 		return;
-	if (!rte_ipv6_addr_eq(&icmp6_ns->target, &ip6_srcaddr))
+	if (!rte_ipv6_addr_eq(&icmp6_ns->target, &ip6_local_addr))
 		return;
 
 	struct rte_mbuf *na_buf = rte_pktmbuf_alloc(mbuf_pool);
@@ -495,7 +499,7 @@ handle_icmp6_ns(struct rte_mbuf *buf)
 	na_ip6_hdr->payload_len = rte_cpu_to_be_16(sizeof(struct icmp6_na) + sizeof(struct icmp6_opt_target_linkaddr));
 	na_ip6_hdr->proto = PE_PROTO_ICMP6;
 	na_ip6_hdr->hop_limits = 255;
-	na_ip6_hdr->src_addr = ip6_srcaddr;
+	na_ip6_hdr->src_addr = ip6_local_addr;
 	na_ip6_hdr->dst_addr = ip6_hdr->src_addr;
 	struct icmp6_na *icmp6_na = (struct icmp6_na *)rte_pktmbuf_append(na_buf, sizeof(struct icmp6_na));
 	if (unlikely(icmp6_na == NULL)) {
@@ -506,7 +510,7 @@ handle_icmp6_ns(struct rte_mbuf *buf)
 	icmp6_na->icmp6_hdr.code = 0;
 	icmp6_na->icmp6_hdr.cksum = 0;
 	icmp6_na->flags_reserved = rte_cpu_to_be_32(NA_FLAG_SOLICITED|NA_FLAG_OVERRIDE);
-	icmp6_na->target = ip6_srcaddr;
+	icmp6_na->target = ip6_local_addr;
 	struct icmp6_opt_target_linkaddr *na_target_linkaddr = (struct icmp6_opt_target_linkaddr *)
 		rte_pktmbuf_append(na_buf, sizeof(struct icmp6_opt_target_linkaddr));
 	if (unlikely(na_target_linkaddr == NULL)) {
@@ -524,8 +528,8 @@ handle_icmp6_ns(struct rte_mbuf *buf)
 
 /*
  * Handle a received NA.
- * Learn the next hop MAC address from the reply to an NS for the peer address
- * (when the peer is on-link).
+ * Learn the next hop MAC address from the reply to an NS for the remote address
+ * (when the remote end is on-link).
  */
 static void
 handle_icmp6_na(struct rte_mbuf *buf)
@@ -553,7 +557,7 @@ handle_icmp6_na(struct rte_mbuf *buf)
 
 	if (nexthop_static)
 		return;
-	if (!rte_ipv6_addr_eq(&icmp6_na->target, &ip6_dstaddr))
+	if (!rte_ipv6_addr_eq(&icmp6_na->target, &ip6_remote_addr))
 		return;
 	if (target_linkaddr != NULL)
 		update_nexthop(target_linkaddr->target_linkaddr);
@@ -586,7 +590,7 @@ handle_icmp6(struct rte_mbuf *buf)
 	}
 }
 
-/* Send an NS to resolve the peer address (to its solicited-node multicast address). */
+/* Send an NS to resolve the remote address (to its solicited-node multicast address). */
 static void
 send_ndp_ns(void)
 {
@@ -607,9 +611,9 @@ send_ndp_ns(void)
 	eth_hdr->dst_addr.addr_bytes[0] = 0x33;
 	eth_hdr->dst_addr.addr_bytes[1] = 0x33;
 	eth_hdr->dst_addr.addr_bytes[2] = 0xff;
-	eth_hdr->dst_addr.addr_bytes[3] = ip6_dstaddr.a[13];
-	eth_hdr->dst_addr.addr_bytes[4] = ip6_dstaddr.a[14];
-	eth_hdr->dst_addr.addr_bytes[5] = ip6_dstaddr.a[15];
+	eth_hdr->dst_addr.addr_bytes[3] = ip6_remote_addr.a[13];
+	eth_hdr->dst_addr.addr_bytes[4] = ip6_remote_addr.a[14];
+	eth_hdr->dst_addr.addr_bytes[5] = ip6_remote_addr.a[15];
 	memcpy(&eth_hdr->src_addr, &ethaddr_ul, sizeof(struct rte_ether_addr));
 	eth_hdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV6);
 	ip6_hdr->vtc_flow = rte_cpu_to_be_32(0x60000000);
@@ -617,14 +621,14 @@ send_ndp_ns(void)
 			+ sizeof(struct icmp6_opt_source_linkaddr));
 	ip6_hdr->proto = PE_PROTO_ICMP6;
 	ip6_hdr->hop_limits = 255;
-	ip6_hdr->src_addr = ip6_srcaddr;
+	ip6_hdr->src_addr = ip6_local_addr;
 	/* Solicited-node multicast address ff02::1:ffXX:XXXX. */
-	rte_ipv6_solnode_from_addr(&ip6_hdr->dst_addr, &ip6_dstaddr);
+	rte_ipv6_solnode_from_addr(&ip6_hdr->dst_addr, &ip6_remote_addr);
 	icmp6_ns->icmp6_hdr.type = ICMP6_NS;
 	icmp6_ns->icmp6_hdr.code = 0;
 	icmp6_ns->icmp6_hdr.cksum = 0;
 	icmp6_ns->reserved = 0;
-	icmp6_ns->target = ip6_dstaddr;
+	icmp6_ns->target = ip6_remote_addr;
 	opt->icmp6_opt_hdr.opt_type = OPT_SOURCE_LINKADDR;
 	opt->icmp6_opt_hdr.opt_len = 1;
 	memcpy(opt->source_linkaddr, ethaddr_ul.addr_bytes, 6);
@@ -666,7 +670,7 @@ send_ndp_rs(void)
 			+ sizeof(struct icmp6_opt_source_linkaddr));
 	ip6_hdr->proto = PE_PROTO_ICMP6;
 	ip6_hdr->hop_limits = 255;
-	ip6_hdr->src_addr = ip6_srcaddr;
+	ip6_hdr->src_addr = ip6_local_addr;
 	ip6_hdr->dst_addr = allrouters;
 	icmp6_rs->icmp6_hdr.type = ICMP6_RS;
 	icmp6_rs->icmp6_hdr.code = 0;
@@ -828,9 +832,9 @@ lcore_ul(__rte_unused void *arg)
 			if (unlikely(ip4_hdr->version_ihl != 0x45))
 				goto to_main;
 			/* Not the tunnel source/destination IPv4 addresses: pass to lcore_main. */
-			if (unlikely(memcmp(&ip4_hdr->src_addr, ip4_dstaddr, 4) != 0))
+			if (unlikely(memcmp(&ip4_hdr->src_addr, ip4_remote_addr, 4) != 0))
 				goto to_main;
-			if (unlikely(memcmp(&ip4_hdr->dst_addr, ip4_srcaddr, 4) != 0))
+			if (unlikely(memcmp(&ip4_hdr->dst_addr, ip4_local_addr, 4) != 0))
 				goto to_main;
 			/* Not the EtherIP protocol number: pass to lcore_main. */
 			if (unlikely(ip4_hdr->next_proto_id != PE_PROTO_ETHERIP))
@@ -865,9 +869,9 @@ lcore_ul(__rte_unused void *arg)
 				goto to_main;
 			ip6_hdr = (struct rte_ipv6_hdr *)(eth_hdr + 1);
 			/* Not the tunnel source/destination IPv6 addresses: pass to lcore_main. */
-			if (unlikely(!rte_ipv6_addr_eq(&ip6_hdr->src_addr, &ip6_dstaddr)))
+			if (unlikely(!rte_ipv6_addr_eq(&ip6_hdr->src_addr, &ip6_remote_addr)))
 				goto to_main;
-			if (unlikely(!rte_ipv6_addr_eq(&ip6_hdr->dst_addr, &ip6_srcaddr)))
+			if (unlikely(!rte_ipv6_addr_eq(&ip6_hdr->dst_addr, &ip6_local_addr)))
 				goto to_main;
 			if (unlikely(ip6_hdr->proto == IPPROTO_FRAGMENT)) {
 				/* Reassemble the packet if it is fragmented. */
@@ -1227,38 +1231,27 @@ lcore_main(void)
 	}
 }
 
+/* Print the settings in effect, as the options that select them. */
 static void
-dump_config(void)
+print_settings(void)
 {
-	if (pe_mode == PE_MODE_IP4)
-		printf("ip4\n");
-	else if (pe_mode == PE_MODE_IP6)
-		printf("ip6\n");
-	else
-		printf("unknown\n");
+	char buf[INET6_ADDRSTRLEN];
+
 	if (pe_mode == PE_MODE_IP4) {
-		for (int i = 0; i < 4; i++)
-			printf("%02x", ip4_dstaddr[i]);
-		printf("\n");
-		for (int i = 0; i < 4; i++)
-			printf("%02x", ip4_srcaddr[i]);
-		printf("\n");
+		printf("mode: EtherIP over IPv4\n");
+		printf("remote: %s\n", inet_ntop(AF_INET, ip4_remote_addr, buf, sizeof(buf)));
+		printf("local: %s\n", inet_ntop(AF_INET, ip4_local_addr, buf, sizeof(buf)));
+	} else {
+		printf("mode: EtherIP over IPv6\n");
+		printf("remote: %s\n", inet_ntop(AF_INET6, ip6_remote_addr.a, buf, sizeof(buf)));
+		printf("local: %s\n", inet_ntop(AF_INET6, ip6_local_addr.a, buf, sizeof(buf)));
 	}
-	if (pe_mode == PE_MODE_IP6) {
-		for (int i = 0; i < RTE_IPV6_ADDR_SIZE; i++)
-			printf("%02x", ip6_dstaddr.a[i]);
-		printf("\n");
-		for (int i = 0; i < RTE_IPV6_ADDR_SIZE; i++)
-			printf("%02x", ip6_srcaddr.a[i]);
-		printf("\n");
-	}
-	printf("mtu %u\n", outer_mtu);
-	if (nexthop_static) {
-		printf("dstmac %02x%02x%02x%02x%02x%02x\n",
-				nexthop_mac.addr_bytes[0], nexthop_mac.addr_bytes[1],
-				nexthop_mac.addr_bytes[2], nexthop_mac.addr_bytes[3],
-				nexthop_mac.addr_bytes[4], nexthop_mac.addr_bytes[5]);
-	}
+	printf("mtu: %u\n", outer_mtu);
+	if (nexthop_static)
+		printf("nexthop-mac: " RTE_ETHER_ADDR_PRT_FMT "\n", RTE_ETHER_ADDR_BYTES(&nexthop_mac));
+	else
+		printf("nexthop-mac: (resolved with %s)\n", pe_mode == PE_MODE_IP4 ? "ARP" : "NDP");
+	printf("stats-socket: %s\n", stats_path);
 }
 
 /* Parse n bytes out of a hex string without separators. */
@@ -1274,21 +1267,6 @@ parse_hex_bytes(const char *s, uint8_t *out, int n)
 		out[i] = (uint8_t)strtol(buff2, NULL, 16);
 	}
 	return 0;
-}
-
-/* Strip the trailing newline, whitespace and comment, leaving the first token. */
-static void
-trim_line(char *s)
-{
-	size_t i;
-	for (i = 0; s[i] != '\0'; i++) {
-		if (s[i] == '\r' || s[i] == '\n' || s[i] == '#') {
-			s[i] = '\0';
-			break;
-		}
-	}
-	while (i > 0 && isspace((unsigned char)s[i-1]))
-		s[--i] = '\0';
 }
 
 /* Parse an IPv4 address. Both dotted ("192.0.2.1") and 8 hex digits are accepted. */
@@ -1323,6 +1301,19 @@ parse_ip6_addr(const char *s, struct rte_ipv6_addr *out)
 	return parse_hex_bytes(s, out->a, RTE_IPV6_ADDR_SIZE);
 }
 
+/*
+ * Parse a tunnel endpoint address of either family, in the textual or the hex
+ * form. Returns the mode the address family implies (PE_MODE_IP4 or PE_MODE_IP6),
+ * or -1 when the string is not an address.
+ */
+static int
+parse_ip_addr(const char *s, uint8_t *out4, struct rte_ipv6_addr *out6)
+{
+	if (strchr(s, ':') != NULL || strnlen(s, RTE_IPV6_ADDR_SIZE * 2 + 1) == RTE_IPV6_ADDR_SIZE * 2)
+		return parse_ip6_addr(s, out6) == 0 ? PE_MODE_IP6 : -1;
+	return parse_ip4_addr(s, out4) == 0 ? PE_MODE_IP4 : -1;
+}
+
 /* Parse a MAC address. Both colon-separated and 12 hex digits are accepted. */
 static int
 parse_mac_addr(const char *s, uint8_t *out)
@@ -1342,162 +1333,6 @@ parse_mac_addr(const char *s, uint8_t *out)
 	return parse_hex_bytes(buff, out, 6);
 }
 
-/*
- * Load the configuration file. The format is:
- *
- *   line 1: mode ("ip4" or "ip6")
- *   line 2: IP address of the peer (dstaddr)
- *   line 3: our own IP address (srcaddr)
- *   line 4 onwards (optional, any order):
- *     mtu <value>      UL side MTU (default 1500)
- *     dstmac <value>   static next hop MAC address
- *                      (resolved with ARP or NDP when omitted)
- *     stats <path>     path of the statistics UNIX socket (default /run/pestats.socket,
- *                      read at startup only, not changed by a SIGHUP reload)
- */
-static int
-load_config(const char *config)
-{
-	FILE *fh;
-	char buff[LINE_MAX];
-	char *retp;
-	int ret = 0;
-
-	int new_pe_mode = -1;
-	uint8_t new_ip4_dstaddr[4] = { 0, };
-	uint8_t new_ip4_srcaddr[4] = { 0, };
-	struct rte_ipv6_addr new_ip6_dstaddr = RTE_IPV6_ADDR_UNSPEC;
-	struct rte_ipv6_addr new_ip6_srcaddr = RTE_IPV6_ADDR_UNSPEC;
-	long new_outer_mtu = PE_DEFAULT_MTU;
-	uint8_t new_nexthop_mac[6] = { 0, };
-	int new_nexthop_static = false;
-
-	fh = fopen(config, "rb");
-	if (fh == NULL) {
-		printf("[%s():%u] fopen %s failed\n", __func__, __LINE__, config);
-		return -1;
-	}
-
-	retp = fgets(buff, LINE_MAX, fh);
-	if (retp == NULL) {
-		printf("[%s():%u] fgets failed\n", __func__, __LINE__);
-		ret = -1;
-		goto exit;
-	}
-	trim_line(buff);
-	if (strcmp("ip4", buff) == 0) {
-		new_pe_mode = PE_MODE_IP4;
-	} else if (strcmp("ip6", buff) == 0) {
-		new_pe_mode = PE_MODE_IP6;
-	} else {
-		printf("[%s():%u] mode invalid\n", __func__, __LINE__);
-		ret = -1;
-		goto exit;
-	}
-
-	retp = fgets(buff, LINE_MAX, fh);
-	if (retp == NULL) {
-		printf("[%s():%u] dst address missing\n", __func__, __LINE__);
-		ret = -1;
-		goto exit;
-	}
-	trim_line(buff);
-	if (new_pe_mode == PE_MODE_IP4)
-		ret = parse_ip4_addr(buff, new_ip4_dstaddr);
-	else
-		ret = parse_ip6_addr(buff, &new_ip6_dstaddr);
-	if (ret != 0) {
-		printf("[%s():%u] dst address invalid\n", __func__, __LINE__);
-		ret = -1;
-		goto exit;
-	}
-
-	retp = fgets(buff, LINE_MAX, fh);
-	if (retp == NULL) {
-		printf("[%s():%u] src address missing\n", __func__, __LINE__);
-		ret = -1;
-		goto exit;
-	}
-	trim_line(buff);
-	if (new_pe_mode == PE_MODE_IP4)
-		ret = parse_ip4_addr(buff, new_ip4_srcaddr);
-	else
-		ret = parse_ip6_addr(buff, &new_ip6_srcaddr);
-	if (ret != 0) {
-		printf("[%s():%u] src address invalid\n", __func__, __LINE__);
-		ret = -1;
-		goto exit;
-	}
-
-	/* Optional settings from line 4 onwards. */
-	while (fgets(buff, LINE_MAX, fh) != NULL) {
-		char key[LINE_MAX];
-		char value[LINE_MAX];
-		trim_line(buff);
-		if (buff[0] == '\0')
-			continue;
-		if (sscanf(buff, "%s %s", key, value) != 2) {
-			printf("[%s():%u] option invalid: %s\n", __func__, __LINE__, buff);
-			ret = -1;
-			goto exit;
-		}
-		if (strcmp(key, "mtu") == 0) {
-			char *endp;
-			new_outer_mtu = strtol(value, &endp, 10);
-			if (*endp != '\0') {
-				printf("[%s():%u] mtu invalid\n", __func__, __LINE__);
-				ret = -1;
-				goto exit;
-			}
-		} else if (strcmp(key, "dstmac") == 0) {
-			if (parse_mac_addr(value, new_nexthop_mac) != 0) {
-				printf("[%s():%u] dstmac invalid\n", __func__, __LINE__);
-				ret = -1;
-				goto exit;
-			}
-			new_nexthop_static = true;
-		} else if (strcmp(key, "stats") == 0) {
-			if (strnlen(value, sizeof(stats_path)) >= sizeof(stats_path)) {
-				printf("[%s():%u] stats path too long\n", __func__, __LINE__);
-				ret = -1;
-				goto exit;
-			}
-			strcpy(stats_path, value);
-		} else {
-			printf("[%s():%u] option unknown: %s\n", __func__, __LINE__, key);
-			ret = -1;
-			goto exit;
-		}
-	}
-
-	/* Check the MTU range. */
-	long min_mtu = (new_pe_mode == PE_MODE_IP4) ? PE_MIN_MTU_IP4 : PE_MIN_MTU_IP6;
-	if (new_outer_mtu < min_mtu || new_outer_mtu > PE_MAX_MTU) {
-		printf("[%s():%u] mtu out of range (%ld-%d)\n", __func__, __LINE__,
-				min_mtu, PE_MAX_MTU);
-		ret = -1;
-		goto exit;
-	}
-
-	pe_mode = new_pe_mode;
-	memcpy(ip4_dstaddr, new_ip4_dstaddr, 4);
-	memcpy(ip4_srcaddr, new_ip4_srcaddr, 4);
-	ip6_dstaddr = new_ip6_dstaddr;
-	ip6_srcaddr = new_ip6_srcaddr;
-	outer_mtu = (uint16_t)new_outer_mtu;
-	nexthop_static = new_nexthop_static;
-	if (nexthop_static) {
-		memcpy(nexthop_mac.addr_bytes, new_nexthop_mac, 6);
-	} else {
-		/* Resolve it again when the next hop is resolved dynamically. */
-		nexthop_ready = false;
-	}
-
-exit:
-	fclose(fh);
-	return ret;
-}
-
 static void
 init_corks(void)
 {
@@ -1513,8 +1348,8 @@ init_corks(void)
 	ip4_hdr_cork.ip4_hdr.time_to_live = 64;
 	ip4_hdr_cork.ip4_hdr.next_proto_id = PE_PROTO_ETHERIP;
 	ip4_hdr_cork.ip4_hdr.hdr_checksum = 0;
-	memcpy(&ip4_hdr_cork.ip4_hdr.src_addr, ip4_srcaddr, 4);
-	memcpy(&ip4_hdr_cork.ip4_hdr.dst_addr, ip4_dstaddr, 4);
+	memcpy(&ip4_hdr_cork.ip4_hdr.src_addr, ip4_local_addr, 4);
+	memcpy(&ip4_hdr_cork.ip4_hdr.dst_addr, ip4_remote_addr, 4);
 	ip4_hdr_cork.etherip_hdr.ver_res = rte_cpu_to_be_16(PE_ETHERIP_VER_RES);
 	/* ip6 */
 	memcpy(&ip6_hdr_cork.eth_hdr.dst_addr, &nexthop_mac, sizeof(struct rte_ether_addr));
@@ -1524,8 +1359,8 @@ init_corks(void)
 	ip6_hdr_cork.ip6_hdr.payload_len = 0;
 	ip6_hdr_cork.ip6_hdr.proto = PE_PROTO_ETHERIP;
 	ip6_hdr_cork.ip6_hdr.hop_limits = 64;
-	ip6_hdr_cork.ip6_hdr.src_addr = ip6_srcaddr;
-	ip6_hdr_cork.ip6_hdr.dst_addr = ip6_dstaddr;
+	ip6_hdr_cork.ip6_hdr.src_addr = ip6_local_addr;
+	ip6_hdr_cork.ip6_hdr.dst_addr = ip6_remote_addr;
 	ip6_hdr_cork.etherip_hdr.ver_res = rte_cpu_to_be_16(PE_ETHERIP_VER_RES);
 	/* Ready to transmit right away when the next hop is static. */
 	if (nexthop_static) {
@@ -1621,68 +1456,155 @@ select_ports(void)
 static void
 print_usage(const char *prgname)
 {
-	printf("%s usage:\n", prgname);
-	printf("[EAL options] -- --"OPTION_CONFIG"=FILE [--"OPTION_UL_PORT"=PORT] [--"OPTION_DL_PORT"=PORT]\n");
-	printf("  --"OPTION_CONFIG"=FILE   configuration file\n");
-	printf("  --"OPTION_UL_PORT"=PORT  port used as the UL side (default: the second port)\n");
-	printf("  --"OPTION_DL_PORT"=PORT  port used as the DL side (default: the first port)\n");
+	printf("Usage: %s [EAL options] -- --remote ADDR --local ADDR [options]\n", prgname);
+	printf("  --remote ADDR         IP address of the remote tunnel endpoint (required)\n");
+	printf("  --local ADDR          IP address of the local tunnel endpoint (required)\n");
+	printf("                        Both IPv4 or both IPv6, which selects the mode.\n");
+	printf("  --mtu N               UL-side MTU (IPv4: %d-%d, IPv6: %d-%d, default %d)\n",
+			PE_MIN_MTU_IP4, PE_MAX_MTU, PE_MIN_MTU_IP6, PE_MAX_MTU, PE_DEFAULT_MTU);
+	printf("  --nexthop-mac MAC     static next-hop MAC address (resolved with ARP/NDP when omitted)\n");
+	printf("  --stats-socket PATH   statistics socket path (default " PESTATS_UNIX_SOCKET_PATH ")\n");
+	printf("  --ul-port PORT        port used as the UL side (default: the second port)\n");
+	printf("  --dl-port PORT        port used as the DL side (default: the first port)\n");
+	printf("  -h, --help            print this help and exit\n");
 	printf("PORT is a port ID or a device name (e.g. 0000:01:00.0 or net_pcap0).\n");
 }
 
+enum {
+	OPT_REMOTE = 256,
+	OPT_LOCAL,
+	OPT_MTU,
+	OPT_NEXTHOP_MAC,
+	OPT_STATS_SOCKET,
+	OPT_UL_PORT,
+	OPT_DL_PORT,
+	OPT_HELP,
+};
+
+/*
+ * Parse the application options (those after "--") and apply them to the
+ * settings. Everything is validated here except the ports, which need the
+ * ethdev layer and are resolved later by select_ports().
+ * Returns 0 on success, 1 when the usage was requested, -1 on error.
+ */
 static int
 parse_args(int argc, char **argv)
 {
-	int opt, ret;
-	char **argvopt;
-	int option_index;
-	char *prgname = argv[0];
-	static struct option lgopts[] = {
-		{OPTION_CONFIG, 1, 0, 0},
-		{OPTION_UL_PORT, 1, 0, 0},
-		{OPTION_DL_PORT, 1, 0, 0},
-		{NULL, 0, 0, 0},
+	static const struct option lgopts[] = {
+		{OPTION_REMOTE, required_argument, NULL, OPT_REMOTE},
+		{OPTION_LOCAL, required_argument, NULL, OPT_LOCAL},
+		{OPTION_MTU, required_argument, NULL, OPT_MTU},
+		{OPTION_NEXTHOP_MAC, required_argument, NULL, OPT_NEXTHOP_MAC},
+		{OPTION_STATS_SOCKET, required_argument, NULL, OPT_STATS_SOCKET},
+		{OPTION_UL_PORT, required_argument, NULL, OPT_UL_PORT},
+		{OPTION_DL_PORT, required_argument, NULL, OPT_DL_PORT},
+		{"help", no_argument, NULL, OPT_HELP},
+		{NULL, 0, NULL, 0},
 	};
+	const char *prgname = argv[0];
+	const char *remote_arg = NULL;
+	const char *local_arg = NULL;
+	const char *mtu_arg = NULL;
+	const char *nexthop_mac_arg = NULL;
+	const char *stats_socket_arg = NULL;
+	int opt, mode_remote, mode_local;
+	long mtu, min_mtu;
+	char *endp;
 
-	argvopt = argv;
-
-	while ((opt = getopt_long(argc, argvopt, "", lgopts, &option_index)) != EOF) {
+	while ((opt = getopt_long(argc, argv, "h", lgopts, NULL)) != EOF) {
 		switch (opt) {
-		case 0:
-			if (!strncmp(lgopts[option_index].name, OPTION_CONFIG, sizeof(OPTION_CONFIG)))
-				config = optarg;
-			else if (!strncmp(lgopts[option_index].name, OPTION_UL_PORT, sizeof(OPTION_UL_PORT)))
-				port_ul_arg = optarg;
-			else if (!strncmp(lgopts[option_index].name, OPTION_DL_PORT, sizeof(OPTION_DL_PORT)))
-				port_dl_arg = optarg;
+		case OPT_REMOTE:
+			remote_arg = optarg;
 			break;
+		case OPT_LOCAL:
+			local_arg = optarg;
+			break;
+		case OPT_MTU:
+			mtu_arg = optarg;
+			break;
+		case OPT_NEXTHOP_MAC:
+			nexthop_mac_arg = optarg;
+			break;
+		case OPT_STATS_SOCKET:
+			stats_socket_arg = optarg;
+			break;
+		case OPT_UL_PORT:
+			port_ul_arg = optarg;
+			break;
+		case OPT_DL_PORT:
+			port_dl_arg = optarg;
+			break;
+		case 'h':
+		case OPT_HELP:
+			print_usage(prgname);
+			return 1;
 		default:
 			print_usage(prgname);
 			return -1;
 		}
 	}
-
-	if (optind >= 0)
-		argv[optind-1] = prgname;
-
-	ret = optind-1;
-	optind = 1;
-	return ret;
-}
-
-static void
-sighup_handler(int signum)
-{
-	if (signum != SIGHUP) {
-		printf("Error: Unknown signal\n");
-		return;
+	if (optind < argc) {
+		printf("Error: unexpected argument: %s\n", argv[optind]);
+		print_usage(prgname);
+		return -1;
 	}
-	int ret = load_config(config);
-	if (ret < 0) {
-		printf("Error: Load config failed\n");
-		return;
+
+	/* Endpoint addresses; their family selects the mode. */
+	if (remote_arg == NULL || local_arg == NULL) {
+		printf("Error: --" OPTION_REMOTE " and --" OPTION_LOCAL " are required\n");
+		print_usage(prgname);
+		return -1;
 	}
-	dump_config();
-	init_corks();
+	mode_remote = parse_ip_addr(remote_arg, ip4_remote_addr, &ip6_remote_addr);
+	if (mode_remote < 0) {
+		printf("Error: remote address invalid: %s\n", remote_arg);
+		return -1;
+	}
+	mode_local = parse_ip_addr(local_arg, ip4_local_addr, &ip6_local_addr);
+	if (mode_local < 0) {
+		printf("Error: local address invalid: %s\n", local_arg);
+		return -1;
+	}
+	if (mode_remote != mode_local) {
+		printf("Error: remote and local addresses must be of the same address family\n");
+		return -1;
+	}
+	pe_mode = mode_remote;
+
+	/* MTU, whose lower bound depends on the mode. */
+	mtu = PE_DEFAULT_MTU;
+	if (mtu_arg != NULL) {
+		mtu = strtol(mtu_arg, &endp, 10);
+		if (mtu_arg[0] == '\0' || *endp != '\0') {
+			printf("Error: mtu invalid: %s\n", mtu_arg);
+			return -1;
+		}
+	}
+	min_mtu = (pe_mode == PE_MODE_IP4) ? PE_MIN_MTU_IP4 : PE_MIN_MTU_IP6;
+	if (mtu < min_mtu || mtu > PE_MAX_MTU) {
+		printf("Error: mtu out of range (%ld-%d)\n", min_mtu, PE_MAX_MTU);
+		return -1;
+	}
+	outer_mtu = (uint16_t)mtu;
+
+	/* Static next hop, if any. */
+	if (nexthop_mac_arg != NULL) {
+		if (parse_mac_addr(nexthop_mac_arg, nexthop_mac.addr_bytes) != 0) {
+			printf("Error: next-hop MAC address invalid: %s\n", nexthop_mac_arg);
+			return -1;
+		}
+		nexthop_static = true;
+	}
+
+	if (stats_socket_arg != NULL) {
+		if (strnlen(stats_socket_arg, sizeof(stats_path)) >= sizeof(stats_path)) {
+			printf("Error: statistics socket path too long\n");
+			return -1;
+		}
+		strcpy(stats_path, stats_socket_arg);
+	}
+
+	return 0;
 }
 
 int
@@ -1692,8 +1614,6 @@ main(int argc, char *argv[])
 	char name_ul[RTE_ETH_NAME_MAX_LEN];
 	char name_dl[RTE_ETH_NAME_MAX_LEN];
 	uint64_t frag_cycles;
-
-	signal(SIGHUP, sighup_handler);
 
 	int ret = rte_eal_init(argc, argv);
 	if (ret < 0)
@@ -1705,6 +1625,11 @@ main(int argc, char *argv[])
 	ret = parse_args(argc, argv);
 	if (ret < 0)
 		rte_exit(EXIT_FAILURE, "Invalid parameters\n");
+	if (ret > 0) {
+		/* --help */
+		rte_eal_cleanup();
+		return 0;
+	}
 
 	if (rte_lcore_count() != 3)
 		rte_exit(EXIT_FAILURE, "Error: number of lcores must be 3\n");
@@ -1712,14 +1637,7 @@ main(int argc, char *argv[])
 	if (select_ports() < 0)
 		rte_exit(EXIT_FAILURE, "Error: port selection failed\n");
 
-	if (config == NULL)
-		rte_exit(EXIT_FAILURE, "Error: config file not specified\n");
-
-	ret = load_config(config);
-	if (ret < 0)
-		rte_exit(EXIT_FAILURE, "Error: Load config failed\n");
-
-	dump_config();
+	print_settings();
 
 	ring_ul2main = rte_ring_create("UL2MAIN", INTERNAL_RING_SIZE, rte_socket_id(), RING_F_SP_ENQ|RING_F_SC_DEQ);
 	if (ring_ul2main == NULL)
