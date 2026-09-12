@@ -290,6 +290,23 @@ The BPDU counters (`ul_rx_bpdus` / `dl_rx_bpdus`) behave the same way as
 in ginzado-pseudowire, so they can be used for liveness monitoring in
 the same manner as its `check_gpwbpdu.pl`.
 
+## Testing
+
+`tests/pwtest.py` exercises the application without NICs, hugepages or
+root: `net_pcap` virtual devices play the DL and UL ports, fed from pcap
+files the script writes, and what the application sends is compared
+byte for byte with what RFC 3378 prescribes (both address families,
+fragmentation and reassembly, jumbo frames, the port and other options,
+and the statistics read through the socket).
+
+```
+$ meson compile -C build
+$ tests/pwtest.py             # or: tests/pwtest.py <substring>, for a subset
+```
+
+It needs DPDK with the `net_pcap` PMD, three CPU cores and about 512 MB
+of free memory; each scenario takes a few seconds.
+
 ## Limitations and caveats
 
 * Only a single remote endpoint is supported (packets whose source and
