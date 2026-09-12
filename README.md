@@ -21,8 +21,11 @@ the DL port.
 > **Status: experimental.** The data plane and control plane have been
 > verified against DPDK 25.11 using the `net_pcap` PMD (bit-exact
 > RFC 3378 encapsulation, encap/decap round trips including
-> fragmentation and reassembly, ARP/NDP next-hop resolution). The
-> application has not yet been tested with real NICs and real traffic.
+> fragmentation and reassembly, ARP/NDP next-hop resolution), and the
+> application has carried real traffic with real NICs (an 82599ES/X520
+> on the UL side and an I226-V on the DL side) over an EtherIP-over-IPv6
+> tunnel to a third-party implementation, with the next hop resolved
+> through NDP. It has not been used in production yet.
 
 ## Differences from ginzado-pseudowire
 

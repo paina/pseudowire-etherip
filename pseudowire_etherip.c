@@ -45,6 +45,13 @@
 #define RX_RING_SIZE 1024
 #define TX_RING_SIZE 1024
 
+/*
+ * Packets taken from a port per rte_eth_rx_burst() call. Vector receive paths
+ * (ixgbe, i40e, ...) return nothing at all for bursts smaller than 4, so this
+ * must not be small; the packets are still handled one by one.
+ */
+#define PE_RX_BURST 32
+
 #define NUM_MBUFS 8191
 #define MBUF_CACHE_SIZE 250
 
@@ -830,153 +837,155 @@ static __rte_noreturn int
 lcore_ul(__rte_unused void *arg)
 {
 	for (;;) {
-		size_t sizeof_hdr;
-		struct rte_mbuf *bufs[1];
-		struct rte_ether_hdr *eth_hdr;
+		struct rte_mbuf *bufs[PE_RX_BURST];
+		uint16_t i;
 
-		/* Take one packet from the UL port. */
-		const uint16_t nb_rx = rte_eth_rx_burst(port_ul, 0, bufs, 1);
-		/* If no packet was taken, go back to the top of the loop. */
-		if (unlikely(nb_rx == 0))
-			continue;
-		pestats.ul_rx_packets += 1;
-		pestats.ul_rx_bytes += bufs[0]->pkt_len;
+		/* Take a burst of packets from the UL port and handle them one by one. */
+		const uint16_t nb_rx = rte_eth_rx_burst(port_ul, 0, bufs, PE_RX_BURST);
+		for (i = 0; i < nb_rx; i++) {
+			struct rte_mbuf *m = bufs[i];
+			size_t sizeof_hdr;
+			struct rte_ether_hdr *eth_hdr;
 
-		if (unlikely(bufs[0]->data_len < sizeof(struct rte_ether_hdr)))
-			goto to_main;
-		eth_hdr = rte_pktmbuf_mtod(bufs[0], struct rte_ether_hdr *);
+			pestats.ul_rx_packets += 1;
+			pestats.ul_rx_bytes += m->pkt_len;
 
-		if (likely(pe_mode == PE_MODE_IP4)) {
-			/* EtherIP over IPv4 mode: */
-			struct rte_ipv4_hdr *ip4_hdr;
-			sizeof_hdr = sizeof(struct pe_ip4_hdr);
-			if (unlikely(eth_hdr->ether_type != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)))
+			if (unlikely(m->data_len < sizeof(struct rte_ether_hdr)))
 				goto to_main;
-			if (unlikely(bufs[0]->data_len < sizeof(struct rte_ether_hdr)
-					+ sizeof(struct rte_ipv4_hdr)))
-				goto to_main;
-			ip4_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
-			/* Packets carrying IP options are not treated as tunnel packets. */
-			if (unlikely(ip4_hdr->version_ihl != 0x45))
-				goto to_main;
-			/* Not the tunnel source/destination IPv4 addresses: pass to lcore_main. */
-			if (unlikely(memcmp(&ip4_hdr->src_addr, ip4_remote_addr, 4) != 0))
-				goto to_main;
-			if (unlikely(memcmp(&ip4_hdr->dst_addr, ip4_local_addr, 4) != 0))
-				goto to_main;
-			/* Not the EtherIP protocol number: pass to lcore_main. */
-			if (unlikely(ip4_hdr->next_proto_id != PE_PROTO_ETHERIP))
-				goto to_main;
-			if (unlikely(rte_ipv4_frag_pkt_is_fragmented(ip4_hdr))) {
-				/* Reassemble the packet if it is fragmented. */
-				struct rte_mbuf *mo;
-				bufs[0]->l2_len = sizeof(struct rte_ether_hdr);
-				bufs[0]->l3_len = sizeof(struct rte_ipv4_hdr);
-				mo = rte_ipv4_frag_reassemble_packet(frag_tbl, &death_row,
-						bufs[0], rte_rdtsc(), ip4_hdr);
-				if (unlikely(death_row.cnt > 0)) {
-					pestats.decap_reasm_drops += death_row.cnt;
-					rte_ip_frag_free_death_row(&death_row, PE_DEATH_ROW_PREFETCH);
-				}
-				/* Go back to the top of the loop while fragments are still missing. */
-				/* (The received packet is held in the reassembly table.) */
-				if (mo == NULL)
-					continue;
-				/* Once reassembly completes, continue with the result as the received packet. */
-				bufs[0] = mo;
-				pestats.decap_reasms += 1;
-			}
-		} else {
-			/* EtherIP over IPv6 mode: */
-			struct rte_ipv6_hdr *ip6_hdr;
-			sizeof_hdr = sizeof(struct pe_ip6_hdr);
-			if (unlikely(eth_hdr->ether_type != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV6)))
-				goto to_main;
-			if (unlikely(bufs[0]->data_len < sizeof(struct rte_ether_hdr)
-					+ sizeof(struct rte_ipv6_hdr)))
-				goto to_main;
-			ip6_hdr = (struct rte_ipv6_hdr *)(eth_hdr + 1);
-			/* Not the tunnel source/destination IPv6 addresses: pass to lcore_main. */
-			if (unlikely(!rte_ipv6_addr_eq(&ip6_hdr->src_addr, &ip6_remote_addr)))
-				goto to_main;
-			if (unlikely(!rte_ipv6_addr_eq(&ip6_hdr->dst_addr, &ip6_local_addr)))
-				goto to_main;
-			if (unlikely(ip6_hdr->proto == IPPROTO_FRAGMENT)) {
-				/* Reassemble the packet if it is fragmented. */
-				/* Only a fragment header placed directly after the IPv6 header is supported. */
-				struct rte_mbuf *mo;
-				struct rte_ipv6_fragment_ext *frag_hdr;
-				if (unlikely(bufs[0]->data_len < sizeof(struct rte_ether_hdr)
-						+ sizeof(struct rte_ipv6_hdr)
-						+ sizeof(struct rte_ipv6_fragment_ext)))
+			eth_hdr = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
+
+			if (likely(pe_mode == PE_MODE_IP4)) {
+				/* EtherIP over IPv4 mode: */
+				struct rte_ipv4_hdr *ip4_hdr;
+				sizeof_hdr = sizeof(struct pe_ip4_hdr);
+				if (unlikely(eth_hdr->ether_type != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)))
 					goto to_main;
-				frag_hdr = (struct rte_ipv6_fragment_ext *)(ip6_hdr + 1);
-				if (unlikely(frag_hdr->next_header != PE_PROTO_ETHERIP))
+				if (unlikely(m->data_len < sizeof(struct rte_ether_hdr)
+						+ sizeof(struct rte_ipv4_hdr)))
 					goto to_main;
-				bufs[0]->l2_len = sizeof(struct rte_ether_hdr);
-				bufs[0]->l3_len = sizeof(struct rte_ipv6_hdr)
-					+ sizeof(struct rte_ipv6_fragment_ext);
-				mo = rte_ipv6_frag_reassemble_packet(frag_tbl, &death_row,
-						bufs[0], rte_rdtsc(), ip6_hdr, frag_hdr);
-				if (unlikely(death_row.cnt > 0)) {
-					pestats.decap_reasm_drops += death_row.cnt;
-					rte_ip_frag_free_death_row(&death_row, PE_DEATH_ROW_PREFETCH);
-				}
-				/* Go back to the top of the loop while fragments are still missing. */
-				/* (The received packet is held in the reassembly table.) */
-				if (mo == NULL)
-					continue;
-				/* Once reassembly completes, continue with the result as the received packet. */
-				bufs[0] = mo;
-				pestats.decap_reasms += 1;
-				eth_hdr = rte_pktmbuf_mtod(bufs[0], struct rte_ether_hdr *);
-				ip6_hdr = (struct rte_ipv6_hdr *)(eth_hdr + 1);
-				/* Check the protocol number after reassembly, just to be safe. */
-				if (unlikely(ip6_hdr->proto != PE_PROTO_ETHERIP))
+				ip4_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
+				/* Packets carrying IP options are not treated as tunnel packets. */
+				if (unlikely(ip4_hdr->version_ihl != 0x45))
 					goto to_main;
-			} else if (unlikely(ip6_hdr->proto != PE_PROTO_ETHERIP)) {
+				/* Not the tunnel source/destination IPv4 addresses: pass to lcore_main. */
+				if (unlikely(memcmp(&ip4_hdr->src_addr, ip4_remote_addr, 4) != 0))
+					goto to_main;
+				if (unlikely(memcmp(&ip4_hdr->dst_addr, ip4_local_addr, 4) != 0))
+					goto to_main;
 				/* Not the EtherIP protocol number: pass to lcore_main. */
+				if (unlikely(ip4_hdr->next_proto_id != PE_PROTO_ETHERIP))
+					goto to_main;
+				if (unlikely(rte_ipv4_frag_pkt_is_fragmented(ip4_hdr))) {
+					/* Reassemble the packet if it is fragmented. */
+					struct rte_mbuf *mo;
+					m->l2_len = sizeof(struct rte_ether_hdr);
+					m->l3_len = sizeof(struct rte_ipv4_hdr);
+					mo = rte_ipv4_frag_reassemble_packet(frag_tbl, &death_row,
+							m, rte_rdtsc(), ip4_hdr);
+					if (unlikely(death_row.cnt > 0)) {
+						pestats.decap_reasm_drops += death_row.cnt;
+						rte_ip_frag_free_death_row(&death_row, PE_DEATH_ROW_PREFETCH);
+					}
+					/* Move on to the next packet while fragments are still missing. */
+					/* (The received packet is held in the reassembly table.) */
+					if (mo == NULL)
+						continue;
+					/* Once reassembly completes, continue with the result as the received packet. */
+					m = mo;
+					pestats.decap_reasms += 1;
+				}
+			} else {
+				/* EtherIP over IPv6 mode: */
+				struct rte_ipv6_hdr *ip6_hdr;
+				sizeof_hdr = sizeof(struct pe_ip6_hdr);
+				if (unlikely(eth_hdr->ether_type != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV6)))
+					goto to_main;
+				if (unlikely(m->data_len < sizeof(struct rte_ether_hdr)
+						+ sizeof(struct rte_ipv6_hdr)))
+					goto to_main;
+				ip6_hdr = (struct rte_ipv6_hdr *)(eth_hdr + 1);
+				/* Not the tunnel source/destination IPv6 addresses: pass to lcore_main. */
+				if (unlikely(!rte_ipv6_addr_eq(&ip6_hdr->src_addr, &ip6_remote_addr)))
+					goto to_main;
+				if (unlikely(!rte_ipv6_addr_eq(&ip6_hdr->dst_addr, &ip6_local_addr)))
+					goto to_main;
+				if (unlikely(ip6_hdr->proto == IPPROTO_FRAGMENT)) {
+					/* Reassemble the packet if it is fragmented. */
+					/* Only a fragment header placed directly after the IPv6 header is supported. */
+					struct rte_mbuf *mo;
+					struct rte_ipv6_fragment_ext *frag_hdr;
+					if (unlikely(m->data_len < sizeof(struct rte_ether_hdr)
+							+ sizeof(struct rte_ipv6_hdr)
+							+ sizeof(struct rte_ipv6_fragment_ext)))
+						goto to_main;
+					frag_hdr = (struct rte_ipv6_fragment_ext *)(ip6_hdr + 1);
+					if (unlikely(frag_hdr->next_header != PE_PROTO_ETHERIP))
+						goto to_main;
+					m->l2_len = sizeof(struct rte_ether_hdr);
+					m->l3_len = sizeof(struct rte_ipv6_hdr)
+						+ sizeof(struct rte_ipv6_fragment_ext);
+					mo = rte_ipv6_frag_reassemble_packet(frag_tbl, &death_row,
+							m, rte_rdtsc(), ip6_hdr, frag_hdr);
+					if (unlikely(death_row.cnt > 0)) {
+						pestats.decap_reasm_drops += death_row.cnt;
+						rte_ip_frag_free_death_row(&death_row, PE_DEATH_ROW_PREFETCH);
+					}
+					/* Move on to the next packet while fragments are still missing. */
+					/* (The received packet is held in the reassembly table.) */
+					if (mo == NULL)
+						continue;
+					/* Once reassembly completes, continue with the result as the received packet. */
+					m = mo;
+					pestats.decap_reasms += 1;
+					eth_hdr = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
+					ip6_hdr = (struct rte_ipv6_hdr *)(eth_hdr + 1);
+					/* Check the protocol number after reassembly, just to be safe. */
+					if (unlikely(ip6_hdr->proto != PE_PROTO_ETHERIP))
+						goto to_main;
+				} else if (unlikely(ip6_hdr->proto != PE_PROTO_ETHERIP)) {
+					/* Not the EtherIP protocol number: pass to lcore_main. */
+					goto to_main;
+				}
+			}
+
+			/* Check the EtherIP version and drop the packet if it differs. */
+			/* Right after reassembly the header can straddle a segment boundary, so read it */
+			/* with rte_pktmbuf_read(), which also checks the packet length. */
+			struct pe_etherip_hdr etherip_hdr_buf;
+			const struct pe_etherip_hdr *etherip_hdr = rte_pktmbuf_read(m,
+					sizeof_hdr - sizeof(struct pe_etherip_hdr),
+					sizeof(struct pe_etherip_hdr), &etherip_hdr_buf);
+			if (unlikely(etherip_hdr == NULL))
+				goto to_main;
+			if (unlikely((rte_be_to_cpu_16(etherip_hdr->ver_res) & 0xf000)
+					!= PE_ETHERIP_VER_RES))
+				goto to_main;
+
+			/* Strip the outer headers (Ethernet + IP + EtherIP); drop the packet on failure. */
+			struct rte_mbuf *stripped = pe_pktmbuf_strip(m, sizeof_hdr);
+			if (unlikely(stripped == NULL))
+				goto to_main;
+			m = stripped;
+			/* Update the UL port BPDU receive counter. */
+			uint8_t bpdu_buf[2];
+			const uint8_t *bpdu = rte_pktmbuf_read(m, 14, 2, bpdu_buf);
+			if (bpdu != NULL && unlikely(bpdu[0] == 0x42 && bpdu[1] == 0x42))
+				pestats.ul_rx_bpdus += 1;
+			const uint64_t txbytes = m->pkt_len;
+			/* Send one packet out the DL port. */
+			const uint16_t nb_tx = rte_eth_tx_burst(port_dl, 0, &m, 1);
+			/* If nothing could be sent, drop the packet. */
+			if (unlikely(nb_tx == 0)) {
+				pestats.dl_tx_errors += 1;
 				goto to_main;
 			}
-		}
-
-		/* Check the EtherIP version and drop the packet if it differs. */
-		/* Right after reassembly the header can straddle a segment boundary, so read it */
-		/* with rte_pktmbuf_read(), which also checks the packet length. */
-		struct pe_etherip_hdr etherip_hdr_buf;
-		const struct pe_etherip_hdr *etherip_hdr = rte_pktmbuf_read(bufs[0],
-				sizeof_hdr - sizeof(struct pe_etherip_hdr),
-				sizeof(struct pe_etherip_hdr), &etherip_hdr_buf);
-		if (unlikely(etherip_hdr == NULL))
-			goto to_main;
-		if (unlikely((rte_be_to_cpu_16(etherip_hdr->ver_res) & 0xf000)
-				!= PE_ETHERIP_VER_RES))
-			goto to_main;
-
-		/* Strip the outer headers (Ethernet + IP + EtherIP); drop the packet on failure. */
-		struct rte_mbuf *stripped = pe_pktmbuf_strip(bufs[0], sizeof_hdr);
-		if (unlikely(stripped == NULL))
-			goto to_main;
-		bufs[0] = stripped;
-		/* Update the UL port BPDU receive counter. */
-		uint8_t bpdu_buf[2];
-		const uint8_t *bpdu = rte_pktmbuf_read(bufs[0], 14, 2, bpdu_buf);
-		if (bpdu != NULL && unlikely(bpdu[0] == 0x42 && bpdu[1] == 0x42))
-			pestats.ul_rx_bpdus += 1;
-		const uint64_t txbytes = bufs[0]->pkt_len;
-		/* Send one packet out the DL port. */
-		const uint16_t nb_tx = rte_eth_tx_burst(port_dl, 0, bufs, 1);
-		/* If nothing could be sent, drop the packet. */
-		if (unlikely(nb_tx == 0)) {
-			pestats.dl_tx_errors += 1;
-			goto to_main;
-		}
-		pestats.dl_tx_packets += 1;
-		pestats.dl_tx_bytes += txbytes;
-		continue;
+			pestats.dl_tx_packets += 1;
+			pestats.dl_tx_bytes += txbytes;
+			continue;
 to_main:
-		if (unlikely(rte_ring_enqueue(ring_ul2main, bufs[0]) != 0))
-			rte_pktmbuf_free(bufs[0]);
+			if (unlikely(rte_ring_enqueue(ring_ul2main, m) != 0))
+				rte_pktmbuf_free(m);
+		}
 	}
 }
 
@@ -993,198 +1002,200 @@ lcore_dl(__rte_unused void *arg)
 	uint16_t ip4_id = 0;
 	uint32_t ip6_frag_id = 0;
 	for (;;) {
-		int ret;
-		int i;
-		struct rte_mbuf *bufs[1];
-		struct rte_mbuf *frags[PE_ENCAP_MAX_FRAGS];
-		int32_t nb_frags;
+		struct rte_mbuf *bufs[PE_RX_BURST];
+		uint16_t n;
 
-		/* Take one packet from the DL port. */
-		const uint16_t nb_rx = rte_eth_rx_burst(port_dl, 0, bufs, 1);
-		/* If no packet was taken, go back to the top of the loop. */
-		if (unlikely(nb_rx == 0))
-			continue;
-		pestats.dl_rx_packets += 1;
-		pestats.dl_rx_bytes += bufs[0]->pkt_len;
+		/* Take a burst of packets from the DL port and handle them one by one. */
+		const uint16_t nb_rx = rte_eth_rx_burst(port_dl, 0, bufs, PE_RX_BURST);
+		for (n = 0; n < nb_rx; n++) {
+			struct rte_mbuf *m = bufs[n];
+			int ret;
+			int i;
+			struct rte_mbuf *frags[PE_ENCAP_MAX_FRAGS];
+			int32_t nb_frags;
 
-		/* Drop the received packet while the next hop MAC address is unresolved. */
-		if (unlikely(!nexthop_ready)) {
-			pestats.encap_noready_drops += 1;
-			goto free;
-		}
+			pestats.dl_rx_packets += 1;
+			pestats.dl_rx_bytes += m->pkt_len;
 
-		/* Update the DL port BPDU receive counter. */
-		if (bufs[0]->data_len >= 16) {
-			uint8_t *headp = rte_pktmbuf_mtod(bufs[0], uint8_t *);
-			if (unlikely(headp[14] == 0x42 && headp[15] == 0x42))
-				pestats.dl_rx_bpdus += 1;
-		}
-
-		if (likely(pe_mode == PE_MODE_IP4)) {
-			/* EtherIP over IPv4 mode: */
-			if (likely(sizeof(struct rte_ipv4_hdr) + sizeof(struct pe_etherip_hdr)
-					+ bufs[0]->pkt_len <= outer_mtu)) {
-				/* No fragmentation needed: */
-				/* Reserve room for the headers at the head of bufs[0]; drop the packet on failure. */
-				struct pe_ip4_hdr *hdr = (struct pe_ip4_hdr *)rte_pktmbuf_prepend(
-						bufs[0], sizeof(struct pe_ip4_hdr));
-				if (unlikely(hdr == NULL))
-					goto free;
-				/* Write the headers. */
-				memcpy(hdr, &ip4_hdr_cork, sizeof(struct pe_ip4_hdr));
-				hdr->ip4_hdr.total_length = rte_cpu_to_be_16(bufs[0]->pkt_len
-						- sizeof(struct rte_ether_hdr));
-				hdr->ip4_hdr.packet_id = rte_cpu_to_be_16(++ip4_id);
-				hdr->ip4_hdr.hdr_checksum = rte_ipv4_cksum(&hdr->ip4_hdr);
-			} else {
-				/* Fragmentation needed: */
-				/* First prepend the headers without the outer Ethernet header */
-				/* (IPv4 + EtherIP) to bufs[0] to form a complete IPv4 packet. */
-				struct rte_ipv4_hdr *ip4_hdr = (struct rte_ipv4_hdr *)
-					rte_pktmbuf_prepend(bufs[0], sizeof(struct rte_ipv4_hdr)
-							+ sizeof(struct pe_etherip_hdr));
-				if (unlikely(ip4_hdr == NULL))
-					goto free;
-				memcpy(ip4_hdr, &ip4_hdr_cork.ip4_hdr, sizeof(struct rte_ipv4_hdr)
-						+ sizeof(struct pe_etherip_hdr));
-				ip4_hdr->total_length = rte_cpu_to_be_16(bufs[0]->pkt_len);
-				ip4_hdr->packet_id = rte_cpu_to_be_16(++ip4_id);
-				/* Do standard IPv4 fragmentation with librte_ip_frag. */
-				nb_frags = rte_ipv4_fragment_packet(bufs[0], frags,
-						PE_ENCAP_MAX_FRAGS, outer_mtu,
-						mbuf_pool, mbuf_pool_indirect);
-				if (unlikely(nb_frags < 0)) {
-					pestats.ul_tx_errors += 1;
-					goto free;
-				}
-				/* Prepend the outer Ethernet header to each fragment and */
-				/* compute the IPv4 header checksum. */
-				for (i = 0; i < nb_frags; i++) {
-					struct rte_ether_hdr *frag_eth_hdr = (struct rte_ether_hdr *)
-						rte_pktmbuf_prepend(frags[i],
-								sizeof(struct rte_ether_hdr));
-					if (unlikely(frag_eth_hdr == NULL)) {
-						for (; i < nb_frags; i++)
-							rte_pktmbuf_free(frags[i]);
-						pestats.ul_tx_errors += 1;
-						goto free;
-					}
-					memcpy(frag_eth_hdr, &ip4_hdr_cork.eth_hdr,
-							sizeof(struct rte_ether_hdr));
-					struct rte_ipv4_hdr *frag_ip4_hdr =
-						(struct rte_ipv4_hdr *)(frag_eth_hdr + 1);
-					frag_ip4_hdr->hdr_checksum = rte_ipv4_cksum(frag_ip4_hdr);
-				}
-				pestats.encap_frags += 1;
-				goto send_frags;
-			}
-		} else {
-			/* EtherIP over IPv6 mode: */
-			if (likely(sizeof(struct rte_ipv6_hdr) + sizeof(struct pe_etherip_hdr)
-					+ bufs[0]->pkt_len <= outer_mtu)) {
-				/* No fragmentation needed: */
-				/* Reserve room for the headers at the head of bufs[0]; drop the packet on failure. */
-				struct pe_ip6_hdr *hdr = (struct pe_ip6_hdr *)rte_pktmbuf_prepend(
-						bufs[0], sizeof(struct pe_ip6_hdr));
-				if (unlikely(hdr == NULL))
-					goto free;
-				/* Write the headers. */
-				memcpy(hdr, &ip6_hdr_cork, sizeof(struct pe_ip6_hdr));
-				hdr->ip6_hdr.payload_len = rte_cpu_to_be_16(bufs[0]->pkt_len
-						- sizeof(struct rte_ether_hdr)
-						- sizeof(struct rte_ipv6_hdr));
-			} else {
-				/* Fragmentation needed: */
-				/* First prepend the headers without the outer Ethernet header */
-				/* (IPv6 + EtherIP) to bufs[0] to form a complete IPv6 packet. */
-				struct rte_ipv6_hdr *ip6_hdr = (struct rte_ipv6_hdr *)
-					rte_pktmbuf_prepend(bufs[0], sizeof(struct rte_ipv6_hdr)
-							+ sizeof(struct pe_etherip_hdr));
-				if (unlikely(ip6_hdr == NULL))
-					goto free;
-				memcpy(ip6_hdr, &ip6_hdr_cork.ip6_hdr, sizeof(struct rte_ipv6_hdr)
-						+ sizeof(struct pe_etherip_hdr));
-				ip6_hdr->payload_len = rte_cpu_to_be_16(bufs[0]->pkt_len
-						- sizeof(struct rte_ipv6_hdr));
-				/* Do standard IPv6 fragmentation with librte_ip_frag. */
-				nb_frags = rte_ipv6_fragment_packet(bufs[0], frags,
-						PE_ENCAP_MAX_FRAGS, outer_mtu,
-						mbuf_pool, mbuf_pool_indirect);
-				if (unlikely(nb_frags < 0)) {
-					pestats.ul_tx_errors += 1;
-					goto free;
-				}
-				/* librte_ip_frag leaves the fragment header ID zeroed, so write a */
-				/* per-packet unique ID here. */
-				ip6_frag_id++;
-				/* Prepend the outer Ethernet header to each fragment. */
-				for (i = 0; i < nb_frags; i++) {
-					struct rte_ipv6_fragment_ext *frag_hdr =
-						rte_pktmbuf_mtod_offset(frags[i],
-								struct rte_ipv6_fragment_ext *,
-								sizeof(struct rte_ipv6_hdr));
-					frag_hdr->id = rte_cpu_to_be_32(ip6_frag_id);
-					struct rte_ether_hdr *frag_eth_hdr = (struct rte_ether_hdr *)
-						rte_pktmbuf_prepend(frags[i],
-								sizeof(struct rte_ether_hdr));
-					if (unlikely(frag_eth_hdr == NULL)) {
-						for (; i < nb_frags; i++)
-							rte_pktmbuf_free(frags[i]);
-						pestats.ul_tx_errors += 1;
-						goto free;
-					}
-					memcpy(frag_eth_hdr, &ip6_hdr_cork.eth_hdr,
-							sizeof(struct rte_ether_hdr));
-				}
-				pestats.encap_frags += 1;
-				goto send_frags;
-			}
-		}
-
-		{
-			/* Transmit path when no fragmentation was needed: */
-			const uint64_t txbytes = bufs[0]->pkt_len;
-			/* Send one packet out the UL port. */
-			const uint16_t nb_tx = rte_eth_tx_burst(port_ul, 0, bufs, 1);
-			/* If nothing could be sent, drop the packet. */
-			if (unlikely(nb_tx == 0)) {
-				pestats.ul_tx_errors += 1;
+			/* Drop the received packet while the next hop MAC address is unresolved. */
+			if (unlikely(!nexthop_ready)) {
+				pestats.encap_noready_drops += 1;
 				goto free;
 			}
-			pestats.ul_tx_packets += 1;
-			pestats.ul_tx_bytes += txbytes;
-		}
-		continue;
 
-send_frags:
-		{
-			/* Transmit path when the packet was fragmented: */
-			uint64_t txbytes = 0;
-			for (i = 0; i < nb_frags; i++)
-				txbytes += frags[i]->pkt_len;
-			/* Send all the fragments out the UL port. */
-			const uint16_t nb_tx = rte_eth_tx_burst(port_ul, 0, frags, nb_frags);
-			/* If not all of them could be sent, drop the ones that failed. */
-			if (unlikely(nb_tx != nb_frags)) {
-				uint16_t buf;
-				for (buf = nb_tx; buf < nb_frags; buf++) {
-					txbytes -= frags[buf]->pkt_len;
-					ret = rte_ring_enqueue(ring_dl2main, frags[buf]);
-					if (unlikely(ret != 0))
-						rte_pktmbuf_free(frags[buf]);
-					pestats.ul_tx_errors += 1;
+			/* Update the DL port BPDU receive counter. */
+			if (m->data_len >= 16) {
+				uint8_t *headp = rte_pktmbuf_mtod(m, uint8_t *);
+				if (unlikely(headp[14] == 0x42 && headp[15] == 0x42))
+					pestats.dl_rx_bpdus += 1;
+			}
+
+			if (likely(pe_mode == PE_MODE_IP4)) {
+				/* EtherIP over IPv4 mode: */
+				if (likely(sizeof(struct rte_ipv4_hdr) + sizeof(struct pe_etherip_hdr)
+						+ m->pkt_len <= outer_mtu)) {
+					/* No fragmentation needed: */
+					/* Reserve room for the headers at the head of m; drop the packet on failure. */
+					struct pe_ip4_hdr *hdr = (struct pe_ip4_hdr *)rte_pktmbuf_prepend(
+							m, sizeof(struct pe_ip4_hdr));
+					if (unlikely(hdr == NULL))
+						goto free;
+					/* Write the headers. */
+					memcpy(hdr, &ip4_hdr_cork, sizeof(struct pe_ip4_hdr));
+					hdr->ip4_hdr.total_length = rte_cpu_to_be_16(m->pkt_len
+							- sizeof(struct rte_ether_hdr));
+					hdr->ip4_hdr.packet_id = rte_cpu_to_be_16(++ip4_id);
+					hdr->ip4_hdr.hdr_checksum = rte_ipv4_cksum(&hdr->ip4_hdr);
+				} else {
+					/* Fragmentation needed: */
+					/* First prepend the headers without the outer Ethernet header */
+					/* (IPv4 + EtherIP) to m to form a complete IPv4 packet. */
+					struct rte_ipv4_hdr *ip4_hdr = (struct rte_ipv4_hdr *)
+						rte_pktmbuf_prepend(m, sizeof(struct rte_ipv4_hdr)
+								+ sizeof(struct pe_etherip_hdr));
+					if (unlikely(ip4_hdr == NULL))
+						goto free;
+					memcpy(ip4_hdr, &ip4_hdr_cork.ip4_hdr, sizeof(struct rte_ipv4_hdr)
+							+ sizeof(struct pe_etherip_hdr));
+					ip4_hdr->total_length = rte_cpu_to_be_16(m->pkt_len);
+					ip4_hdr->packet_id = rte_cpu_to_be_16(++ip4_id);
+					/* Do standard IPv4 fragmentation with librte_ip_frag. */
+					nb_frags = rte_ipv4_fragment_packet(m, frags,
+							PE_ENCAP_MAX_FRAGS, outer_mtu,
+							mbuf_pool, mbuf_pool_indirect);
+					if (unlikely(nb_frags < 0)) {
+						pestats.ul_tx_errors += 1;
+						goto free;
+					}
+					/* Prepend the outer Ethernet header to each fragment and */
+					/* compute the IPv4 header checksum. */
+					for (i = 0; i < nb_frags; i++) {
+						struct rte_ether_hdr *frag_eth_hdr = (struct rte_ether_hdr *)
+							rte_pktmbuf_prepend(frags[i],
+									sizeof(struct rte_ether_hdr));
+						if (unlikely(frag_eth_hdr == NULL)) {
+							for (; i < nb_frags; i++)
+								rte_pktmbuf_free(frags[i]);
+							pestats.ul_tx_errors += 1;
+							goto free;
+						}
+						memcpy(frag_eth_hdr, &ip4_hdr_cork.eth_hdr,
+								sizeof(struct rte_ether_hdr));
+						struct rte_ipv4_hdr *frag_ip4_hdr =
+							(struct rte_ipv4_hdr *)(frag_eth_hdr + 1);
+						frag_ip4_hdr->hdr_checksum = rte_ipv4_cksum(frag_ip4_hdr);
+					}
+					pestats.encap_frags += 1;
+					goto send_frags;
+				}
+			} else {
+				/* EtherIP over IPv6 mode: */
+				if (likely(sizeof(struct rte_ipv6_hdr) + sizeof(struct pe_etherip_hdr)
+						+ m->pkt_len <= outer_mtu)) {
+					/* No fragmentation needed: */
+					/* Reserve room for the headers at the head of m; drop the packet on failure. */
+					struct pe_ip6_hdr *hdr = (struct pe_ip6_hdr *)rte_pktmbuf_prepend(
+							m, sizeof(struct pe_ip6_hdr));
+					if (unlikely(hdr == NULL))
+						goto free;
+					/* Write the headers. */
+					memcpy(hdr, &ip6_hdr_cork, sizeof(struct pe_ip6_hdr));
+					hdr->ip6_hdr.payload_len = rte_cpu_to_be_16(m->pkt_len
+							- sizeof(struct rte_ether_hdr)
+							- sizeof(struct rte_ipv6_hdr));
+				} else {
+					/* Fragmentation needed: */
+					/* First prepend the headers without the outer Ethernet header */
+					/* (IPv6 + EtherIP) to m to form a complete IPv6 packet. */
+					struct rte_ipv6_hdr *ip6_hdr = (struct rte_ipv6_hdr *)
+						rte_pktmbuf_prepend(m, sizeof(struct rte_ipv6_hdr)
+								+ sizeof(struct pe_etherip_hdr));
+					if (unlikely(ip6_hdr == NULL))
+						goto free;
+					memcpy(ip6_hdr, &ip6_hdr_cork.ip6_hdr, sizeof(struct rte_ipv6_hdr)
+							+ sizeof(struct pe_etherip_hdr));
+					ip6_hdr->payload_len = rte_cpu_to_be_16(m->pkt_len
+							- sizeof(struct rte_ipv6_hdr));
+					/* Do standard IPv6 fragmentation with librte_ip_frag. */
+					nb_frags = rte_ipv6_fragment_packet(m, frags,
+							PE_ENCAP_MAX_FRAGS, outer_mtu,
+							mbuf_pool, mbuf_pool_indirect);
+					if (unlikely(nb_frags < 0)) {
+						pestats.ul_tx_errors += 1;
+						goto free;
+					}
+					/* librte_ip_frag leaves the fragment header ID zeroed, so write a */
+					/* per-packet unique ID here. */
+					ip6_frag_id++;
+					/* Prepend the outer Ethernet header to each fragment. */
+					for (i = 0; i < nb_frags; i++) {
+						struct rte_ipv6_fragment_ext *frag_hdr =
+							rte_pktmbuf_mtod_offset(frags[i],
+									struct rte_ipv6_fragment_ext *,
+									sizeof(struct rte_ipv6_hdr));
+						frag_hdr->id = rte_cpu_to_be_32(ip6_frag_id);
+						struct rte_ether_hdr *frag_eth_hdr = (struct rte_ether_hdr *)
+							rte_pktmbuf_prepend(frags[i],
+									sizeof(struct rte_ether_hdr));
+						if (unlikely(frag_eth_hdr == NULL)) {
+							for (; i < nb_frags; i++)
+								rte_pktmbuf_free(frags[i]);
+							pestats.ul_tx_errors += 1;
+							goto free;
+						}
+						memcpy(frag_eth_hdr, &ip6_hdr_cork.eth_hdr,
+								sizeof(struct rte_ether_hdr));
+					}
+					pestats.encap_frags += 1;
+					goto send_frags;
 				}
 			}
-			pestats.ul_tx_packets += nb_tx;
-			pestats.ul_tx_bytes += txbytes;
-			/* bufs[0] is not transmitted directly, so free it here. The fragments */
-			/* reference its data, so it is actually released once they are */
-			/* freed. */
-		}
+
+			{
+				/* Transmit path when no fragmentation was needed: */
+				const uint64_t txbytes = m->pkt_len;
+				/* Send one packet out the UL port. */
+				const uint16_t nb_tx = rte_eth_tx_burst(port_ul, 0, &m, 1);
+				/* If nothing could be sent, drop the packet. */
+				if (unlikely(nb_tx == 0)) {
+					pestats.ul_tx_errors += 1;
+					goto free;
+				}
+				pestats.ul_tx_packets += 1;
+				pestats.ul_tx_bytes += txbytes;
+			}
+			continue;
+
+send_frags:
+			{
+				/* Transmit path when the packet was fragmented: */
+				uint64_t txbytes = 0;
+				for (i = 0; i < nb_frags; i++)
+					txbytes += frags[i]->pkt_len;
+				/* Send all the fragments out the UL port. */
+				const uint16_t nb_tx = rte_eth_tx_burst(port_ul, 0, frags, nb_frags);
+				/* If not all of them could be sent, drop the ones that failed. */
+				if (unlikely(nb_tx != nb_frags)) {
+					uint16_t buf;
+					for (buf = nb_tx; buf < nb_frags; buf++) {
+						txbytes -= frags[buf]->pkt_len;
+						ret = rte_ring_enqueue(ring_dl2main, frags[buf]);
+						if (unlikely(ret != 0))
+							rte_pktmbuf_free(frags[buf]);
+						pestats.ul_tx_errors += 1;
+					}
+				}
+				pestats.ul_tx_packets += nb_tx;
+				pestats.ul_tx_bytes += txbytes;
+				/* m is not transmitted directly, so free it here. The fragments */
+				/* reference its data, so it is actually released once they are */
+				/* freed. */
+			}
 free:
-		ret = rte_ring_enqueue(ring_dl2main, bufs[0]);
-		if (unlikely(ret != 0))
-			rte_pktmbuf_free(bufs[0]);
+			ret = rte_ring_enqueue(ring_dl2main, m);
+			if (unlikely(ret != 0))
+				rte_pktmbuf_free(m);
+		}
 	}
 }
 
