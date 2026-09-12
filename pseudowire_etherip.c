@@ -11,7 +11,7 @@
  * - EtherIP packets received on the UL port are decapsulated and sent out the DL port.
  * - Encapsulated packets exceeding the UL MTU are split with standard IP fragmentation,
  *   and fragmented packets received on the UL port are reassembled, both using
- *   librte_ip_frag. The peer therefore does not have to be this application: any
+ *   librte_ip_frag. The remote end therefore does not have to be this application: any
  *   implementation that speaks EtherIP (BSD gif/etherip, router products, ...) will do.
  */
 
@@ -77,7 +77,7 @@
  * (number of entries / TTL) determines the tolerance against fragment loss.
  * The table can hold up to PE_FRAG_TBL_MAX_ENTRIES * RTE_LIBRTE_IP_FRAG_MAX_FRAG
  * mbufs, so keep it small enough relative to the mbuf pool size.
- * The peer is a single node and reordering on the path is rare, so a short TTL is fine.
+ * The remote end is a single node and reordering on the path is rare, so a short TTL is fine.
  */
 #define PE_FRAG_TBL_BUCKET_NUM 2048
 #define PE_FRAG_TBL_BUCKET_ENTRIES 16
@@ -115,11 +115,14 @@ struct rte_ether_addr ethaddr_dl;
 
 int pe_mode = -1;
 
-/* Peer and local tunnel IP addresses (network byte order). */
-uint8_t ip4_dstaddr[4];
-uint8_t ip4_srcaddr[4];
-struct rte_ipv6_addr ip6_dstaddr;
-struct rte_ipv6_addr ip6_srcaddr;
+/*
+ * Remote and local tunnel endpoint addresses (network byte order): the
+ * destination and source addresses of the outer IP header of packets we send.
+ */
+uint8_t ip4_remote_addr[4];
+uint8_t ip4_local_addr[4];
+struct rte_ipv6_addr ip6_remote_addr;
+struct rte_ipv6_addr ip6_local_addr;
 
 /* UL side MTU (maximum size of the outer IP packet). */
 uint16_t outer_mtu = PE_DEFAULT_MTU;
@@ -310,15 +313,15 @@ handle_arp(struct rte_mbuf *buf)
 	if (arp_hdr->arp_hlen != 6 || arp_hdr->arp_plen != 4)
 		return;
 
-	/* Learn the source MAC address from ARP sent by the peer (or by the next hop). */
+	/* Learn the source MAC address from ARP sent by the remote end (or by the next hop). */
 	if (!nexthop_static &&
-			memcmp(&arp_hdr->arp_data.arp_sip, ip4_dstaddr, 4) == 0)
+			memcmp(&arp_hdr->arp_data.arp_sip, ip4_remote_addr, 4) == 0)
 		update_nexthop(arp_hdr->arp_data.arp_sha.addr_bytes);
 
 	/* Reply to ARP requests for our own address. */
 	if (arp_hdr->arp_opcode != rte_cpu_to_be_16(RTE_ARP_OP_REQUEST))
 		return;
-	if (memcmp(&arp_hdr->arp_data.arp_tip, ip4_srcaddr, 4) != 0)
+	if (memcmp(&arp_hdr->arp_data.arp_tip, ip4_local_addr, 4) != 0)
 		return;
 
 	struct rte_mbuf *rep_buf = rte_pktmbuf_alloc(mbuf_pool);
@@ -340,7 +343,7 @@ handle_arp(struct rte_mbuf *buf)
 	rep_arp_hdr->arp_plen = 4;
 	rep_arp_hdr->arp_opcode = rte_cpu_to_be_16(RTE_ARP_OP_REPLY);
 	memcpy(&rep_arp_hdr->arp_data.arp_sha, &ethaddr_ul, sizeof(struct rte_ether_addr));
-	memcpy(&rep_arp_hdr->arp_data.arp_sip, ip4_srcaddr, 4);
+	memcpy(&rep_arp_hdr->arp_data.arp_sip, ip4_local_addr, 4);
 	memcpy(&rep_arp_hdr->arp_data.arp_tha, &arp_hdr->arp_data.arp_sha, sizeof(struct rte_ether_addr));
 	memcpy(&rep_arp_hdr->arp_data.arp_tip, &arp_hdr->arp_data.arp_sip, 4);
 	const uint16_t nb_tx = rte_eth_tx_burst(port_ul, 1, &rep_buf, 1);
@@ -348,7 +351,7 @@ handle_arp(struct rte_mbuf *buf)
 		rte_pktmbuf_free(rep_buf);
 }
 
-/* Send an ARP request to resolve the peer address. */
+/* Send an ARP request to resolve the remote address. */
 static void
 send_arp_request(void)
 {
@@ -371,9 +374,9 @@ send_arp_request(void)
 	arp_hdr->arp_plen = 4;
 	arp_hdr->arp_opcode = rte_cpu_to_be_16(RTE_ARP_OP_REQUEST);
 	memcpy(&arp_hdr->arp_data.arp_sha, &ethaddr_ul, sizeof(struct rte_ether_addr));
-	memcpy(&arp_hdr->arp_data.arp_sip, ip4_srcaddr, 4);
+	memcpy(&arp_hdr->arp_data.arp_sip, ip4_local_addr, 4);
 	memset(&arp_hdr->arp_data.arp_tha, 0, sizeof(struct rte_ether_addr));
-	memcpy(&arp_hdr->arp_data.arp_tip, ip4_dstaddr, 4);
+	memcpy(&arp_hdr->arp_data.arp_tip, ip4_remote_addr, 4);
 	const uint16_t nb_tx = rte_eth_tx_burst(port_ul, 1, &req_buf, 1);
 	if (unlikely(nb_tx == 0))
 		rte_pktmbuf_free(req_buf);
@@ -401,8 +404,8 @@ is_icmp6(struct rte_mbuf *buf)
 /*
  * Handle a received RA.
  * As in ginzado-pseudowire, learn the MAC address of the router advertising the same
- * prefix as our own address as the next hop (for topologies like NGN, where the peer
- * is off-link and reached through a router).
+ * prefix as our own address as the next hop (for topologies like NGN, where the remote
+ * end is off-link and reached through a router).
  */
 static void
 handle_icmp6_ra(struct rte_mbuf *buf)
@@ -433,7 +436,7 @@ handle_icmp6_ra(struct rte_mbuf *buf)
 	}
 	if (source_linkaddr == NULL || prefix_info == NULL)
 		return;
-	if (memcmp(&ip6_srcaddr, &prefix_info->prefix, 8) != 0)
+	if (memcmp(&ip6_local_addr, &prefix_info->prefix, 8) != 0)
 		return;
 	if (nexthop_static)
 		return;
@@ -470,7 +473,7 @@ handle_icmp6_ns(struct rte_mbuf *buf)
 
 	if (source_linkaddr == NULL)
 		return;
-	if (!rte_ipv6_addr_eq(&icmp6_ns->target, &ip6_srcaddr))
+	if (!rte_ipv6_addr_eq(&icmp6_ns->target, &ip6_local_addr))
 		return;
 
 	struct rte_mbuf *na_buf = rte_pktmbuf_alloc(mbuf_pool);
@@ -495,7 +498,7 @@ handle_icmp6_ns(struct rte_mbuf *buf)
 	na_ip6_hdr->payload_len = rte_cpu_to_be_16(sizeof(struct icmp6_na) + sizeof(struct icmp6_opt_target_linkaddr));
 	na_ip6_hdr->proto = PE_PROTO_ICMP6;
 	na_ip6_hdr->hop_limits = 255;
-	na_ip6_hdr->src_addr = ip6_srcaddr;
+	na_ip6_hdr->src_addr = ip6_local_addr;
 	na_ip6_hdr->dst_addr = ip6_hdr->src_addr;
 	struct icmp6_na *icmp6_na = (struct icmp6_na *)rte_pktmbuf_append(na_buf, sizeof(struct icmp6_na));
 	if (unlikely(icmp6_na == NULL)) {
@@ -506,7 +509,7 @@ handle_icmp6_ns(struct rte_mbuf *buf)
 	icmp6_na->icmp6_hdr.code = 0;
 	icmp6_na->icmp6_hdr.cksum = 0;
 	icmp6_na->flags_reserved = rte_cpu_to_be_32(NA_FLAG_SOLICITED|NA_FLAG_OVERRIDE);
-	icmp6_na->target = ip6_srcaddr;
+	icmp6_na->target = ip6_local_addr;
 	struct icmp6_opt_target_linkaddr *na_target_linkaddr = (struct icmp6_opt_target_linkaddr *)
 		rte_pktmbuf_append(na_buf, sizeof(struct icmp6_opt_target_linkaddr));
 	if (unlikely(na_target_linkaddr == NULL)) {
@@ -524,8 +527,8 @@ handle_icmp6_ns(struct rte_mbuf *buf)
 
 /*
  * Handle a received NA.
- * Learn the next hop MAC address from the reply to an NS for the peer address
- * (when the peer is on-link).
+ * Learn the next hop MAC address from the reply to an NS for the remote address
+ * (when the remote end is on-link).
  */
 static void
 handle_icmp6_na(struct rte_mbuf *buf)
@@ -553,7 +556,7 @@ handle_icmp6_na(struct rte_mbuf *buf)
 
 	if (nexthop_static)
 		return;
-	if (!rte_ipv6_addr_eq(&icmp6_na->target, &ip6_dstaddr))
+	if (!rte_ipv6_addr_eq(&icmp6_na->target, &ip6_remote_addr))
 		return;
 	if (target_linkaddr != NULL)
 		update_nexthop(target_linkaddr->target_linkaddr);
@@ -586,7 +589,7 @@ handle_icmp6(struct rte_mbuf *buf)
 	}
 }
 
-/* Send an NS to resolve the peer address (to its solicited-node multicast address). */
+/* Send an NS to resolve the remote address (to its solicited-node multicast address). */
 static void
 send_ndp_ns(void)
 {
@@ -607,9 +610,9 @@ send_ndp_ns(void)
 	eth_hdr->dst_addr.addr_bytes[0] = 0x33;
 	eth_hdr->dst_addr.addr_bytes[1] = 0x33;
 	eth_hdr->dst_addr.addr_bytes[2] = 0xff;
-	eth_hdr->dst_addr.addr_bytes[3] = ip6_dstaddr.a[13];
-	eth_hdr->dst_addr.addr_bytes[4] = ip6_dstaddr.a[14];
-	eth_hdr->dst_addr.addr_bytes[5] = ip6_dstaddr.a[15];
+	eth_hdr->dst_addr.addr_bytes[3] = ip6_remote_addr.a[13];
+	eth_hdr->dst_addr.addr_bytes[4] = ip6_remote_addr.a[14];
+	eth_hdr->dst_addr.addr_bytes[5] = ip6_remote_addr.a[15];
 	memcpy(&eth_hdr->src_addr, &ethaddr_ul, sizeof(struct rte_ether_addr));
 	eth_hdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV6);
 	ip6_hdr->vtc_flow = rte_cpu_to_be_32(0x60000000);
@@ -617,14 +620,14 @@ send_ndp_ns(void)
 			+ sizeof(struct icmp6_opt_source_linkaddr));
 	ip6_hdr->proto = PE_PROTO_ICMP6;
 	ip6_hdr->hop_limits = 255;
-	ip6_hdr->src_addr = ip6_srcaddr;
+	ip6_hdr->src_addr = ip6_local_addr;
 	/* Solicited-node multicast address ff02::1:ffXX:XXXX. */
-	rte_ipv6_solnode_from_addr(&ip6_hdr->dst_addr, &ip6_dstaddr);
+	rte_ipv6_solnode_from_addr(&ip6_hdr->dst_addr, &ip6_remote_addr);
 	icmp6_ns->icmp6_hdr.type = ICMP6_NS;
 	icmp6_ns->icmp6_hdr.code = 0;
 	icmp6_ns->icmp6_hdr.cksum = 0;
 	icmp6_ns->reserved = 0;
-	icmp6_ns->target = ip6_dstaddr;
+	icmp6_ns->target = ip6_remote_addr;
 	opt->icmp6_opt_hdr.opt_type = OPT_SOURCE_LINKADDR;
 	opt->icmp6_opt_hdr.opt_len = 1;
 	memcpy(opt->source_linkaddr, ethaddr_ul.addr_bytes, 6);
@@ -666,7 +669,7 @@ send_ndp_rs(void)
 			+ sizeof(struct icmp6_opt_source_linkaddr));
 	ip6_hdr->proto = PE_PROTO_ICMP6;
 	ip6_hdr->hop_limits = 255;
-	ip6_hdr->src_addr = ip6_srcaddr;
+	ip6_hdr->src_addr = ip6_local_addr;
 	ip6_hdr->dst_addr = allrouters;
 	icmp6_rs->icmp6_hdr.type = ICMP6_RS;
 	icmp6_rs->icmp6_hdr.code = 0;
@@ -828,9 +831,9 @@ lcore_ul(__rte_unused void *arg)
 			if (unlikely(ip4_hdr->version_ihl != 0x45))
 				goto to_main;
 			/* Not the tunnel source/destination IPv4 addresses: pass to lcore_main. */
-			if (unlikely(memcmp(&ip4_hdr->src_addr, ip4_dstaddr, 4) != 0))
+			if (unlikely(memcmp(&ip4_hdr->src_addr, ip4_remote_addr, 4) != 0))
 				goto to_main;
-			if (unlikely(memcmp(&ip4_hdr->dst_addr, ip4_srcaddr, 4) != 0))
+			if (unlikely(memcmp(&ip4_hdr->dst_addr, ip4_local_addr, 4) != 0))
 				goto to_main;
 			/* Not the EtherIP protocol number: pass to lcore_main. */
 			if (unlikely(ip4_hdr->next_proto_id != PE_PROTO_ETHERIP))
@@ -865,9 +868,9 @@ lcore_ul(__rte_unused void *arg)
 				goto to_main;
 			ip6_hdr = (struct rte_ipv6_hdr *)(eth_hdr + 1);
 			/* Not the tunnel source/destination IPv6 addresses: pass to lcore_main. */
-			if (unlikely(!rte_ipv6_addr_eq(&ip6_hdr->src_addr, &ip6_dstaddr)))
+			if (unlikely(!rte_ipv6_addr_eq(&ip6_hdr->src_addr, &ip6_remote_addr)))
 				goto to_main;
-			if (unlikely(!rte_ipv6_addr_eq(&ip6_hdr->dst_addr, &ip6_srcaddr)))
+			if (unlikely(!rte_ipv6_addr_eq(&ip6_hdr->dst_addr, &ip6_local_addr)))
 				goto to_main;
 			if (unlikely(ip6_hdr->proto == IPPROTO_FRAGMENT)) {
 				/* Reassemble the packet if it is fragmented. */
@@ -1238,18 +1241,18 @@ dump_config(void)
 		printf("unknown\n");
 	if (pe_mode == PE_MODE_IP4) {
 		for (int i = 0; i < 4; i++)
-			printf("%02x", ip4_dstaddr[i]);
+			printf("%02x", ip4_remote_addr[i]);
 		printf("\n");
 		for (int i = 0; i < 4; i++)
-			printf("%02x", ip4_srcaddr[i]);
+			printf("%02x", ip4_local_addr[i]);
 		printf("\n");
 	}
 	if (pe_mode == PE_MODE_IP6) {
 		for (int i = 0; i < RTE_IPV6_ADDR_SIZE; i++)
-			printf("%02x", ip6_dstaddr.a[i]);
+			printf("%02x", ip6_remote_addr.a[i]);
 		printf("\n");
 		for (int i = 0; i < RTE_IPV6_ADDR_SIZE; i++)
-			printf("%02x", ip6_srcaddr.a[i]);
+			printf("%02x", ip6_local_addr.a[i]);
 		printf("\n");
 	}
 	printf("mtu %u\n", outer_mtu);
@@ -1346,7 +1349,7 @@ parse_mac_addr(const char *s, uint8_t *out)
  * Load the configuration file. The format is:
  *
  *   line 1: mode ("ip4" or "ip6")
- *   line 2: IP address of the peer (dstaddr)
+ *   line 2: IP address of the remote end (dstaddr)
  *   line 3: our own IP address (srcaddr)
  *   line 4 onwards (optional, any order):
  *     mtu <value>      UL side MTU (default 1500)
@@ -1480,10 +1483,10 @@ load_config(const char *config)
 	}
 
 	pe_mode = new_pe_mode;
-	memcpy(ip4_dstaddr, new_ip4_dstaddr, 4);
-	memcpy(ip4_srcaddr, new_ip4_srcaddr, 4);
-	ip6_dstaddr = new_ip6_dstaddr;
-	ip6_srcaddr = new_ip6_srcaddr;
+	memcpy(ip4_remote_addr, new_ip4_dstaddr, 4);
+	memcpy(ip4_local_addr, new_ip4_srcaddr, 4);
+	ip6_remote_addr = new_ip6_dstaddr;
+	ip6_local_addr = new_ip6_srcaddr;
 	outer_mtu = (uint16_t)new_outer_mtu;
 	nexthop_static = new_nexthop_static;
 	if (nexthop_static) {
@@ -1513,8 +1516,8 @@ init_corks(void)
 	ip4_hdr_cork.ip4_hdr.time_to_live = 64;
 	ip4_hdr_cork.ip4_hdr.next_proto_id = PE_PROTO_ETHERIP;
 	ip4_hdr_cork.ip4_hdr.hdr_checksum = 0;
-	memcpy(&ip4_hdr_cork.ip4_hdr.src_addr, ip4_srcaddr, 4);
-	memcpy(&ip4_hdr_cork.ip4_hdr.dst_addr, ip4_dstaddr, 4);
+	memcpy(&ip4_hdr_cork.ip4_hdr.src_addr, ip4_local_addr, 4);
+	memcpy(&ip4_hdr_cork.ip4_hdr.dst_addr, ip4_remote_addr, 4);
 	ip4_hdr_cork.etherip_hdr.ver_res = rte_cpu_to_be_16(PE_ETHERIP_VER_RES);
 	/* ip6 */
 	memcpy(&ip6_hdr_cork.eth_hdr.dst_addr, &nexthop_mac, sizeof(struct rte_ether_addr));
@@ -1524,8 +1527,8 @@ init_corks(void)
 	ip6_hdr_cork.ip6_hdr.payload_len = 0;
 	ip6_hdr_cork.ip6_hdr.proto = PE_PROTO_ETHERIP;
 	ip6_hdr_cork.ip6_hdr.hop_limits = 64;
-	ip6_hdr_cork.ip6_hdr.src_addr = ip6_srcaddr;
-	ip6_hdr_cork.ip6_hdr.dst_addr = ip6_dstaddr;
+	ip6_hdr_cork.ip6_hdr.src_addr = ip6_local_addr;
+	ip6_hdr_cork.ip6_hdr.dst_addr = ip6_remote_addr;
 	ip6_hdr_cork.etherip_hdr.ver_res = rte_cpu_to_be_16(PE_ETHERIP_VER_RES);
 	/* Ready to transmit right away when the next hop is static. */
 	if (nexthop_static) {

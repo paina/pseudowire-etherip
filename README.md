@@ -5,9 +5,9 @@ tunnels, over either IPv4 or IPv6.
 
 It is derived from ginzado-pseudowire
 (<https://github.com/ginzado/dpdk>), replacing its proprietary
-encapsulation with standard EtherIP (IP protocol number 97). The peer
-therefore does not have to be this application: any implementation that
-speaks EtherIP (the gif/etherip interfaces of BSD-derived operating
+encapsulation with standard EtherIP (IP protocol number 97). The remote
+end therefore does not have to be this application: any implementation
+that speaks EtherIP (the gif/etherip interfaces of BSD-derived operating
 systems, router products from various vendors, ...) will interoperate.
 
 * EtherIP over IPv4 (`ip4` mode)
@@ -26,8 +26,8 @@ the DL port.
 
 ## Differences from ginzado-pseudowire
 
-* The encapsulation is standard EtherIP (RFC 3378), so the peer can be
-  any EtherIP implementation.
+* The encapsulation is standard EtherIP (RFC 3378), so the remote end
+  can be any EtherIP implementation.
 * Oversized packets are split with standard IP fragmentation (IPv4
   fragments / the IPv6 fragment extension header) instead of a
   proprietary format. Fragmentation and reassembly use DPDK's
@@ -74,7 +74,7 @@ before decapsulation.
 
 When passing an inner MTU of 1500 (1514-byte frames) through an outer
 MTU of 1500, every full-sized frame is split in two. If the outer path
-can carry jumbo frames, raising the MTU on the peer network is
+can carry jumbo frames, raising the MTU of the underlying network is
 preferable; but where the path MTU cannot be changed (e.g. the
 "IPv6 folded-back" connectivity within the NTT FLET'S network in Japan),
 fragmentation lets such frames through as-is.
@@ -97,17 +97,17 @@ the outer Ethernet header) is determined by one of the following. Frames
 received on the DL side are discarded until it is resolved.
 
 * If `dstmac` is set in the configuration, that value is always used.
-* `ip4` mode: an ARP request for the peer address is sent every second
-  and the answer is learned. ARP requests for the local address are
-  answered. (This assumes the peer is on-link; if it is off-link,
-  specify the gateway's MAC address with `dstmac`.)
-* `ip6` mode: an NS and an RS for the peer address are sent every
-  second and NAs are learned (when the peer is on-link). As in
+* `ip4` mode: an ARP request for the remote address is sent every
+  second and the answer is learned. ARP requests for the local address
+  are answered. (This assumes the remote end is on-link; if it is
+  off-link, specify the gateway's MAC address with `dstmac`.)
+* `ip6` mode: an NS and an RS for the remote address are sent every
+  second and NAs are learned (when the remote end is on-link). As in
   ginzado-pseudowire, when an RA advertising the same prefix as the
   local address is received, the MAC address of its sender (the router)
   is learned (for cases like the NTT FLET'S folded-back connectivity
-  where the peer is behind a router). NSes for the local address are
-  answered with an NA.
+  where the remote end is behind a router). NSes for the local address
+  are answered with an NA.
 
 ## Building
 
@@ -160,15 +160,15 @@ first port is the DL side and the second is the UL side.
 
 ### Configuration file
 
-Lines 1-3 are, in order, the mode, the peer address (`dstaddr`) and the
-local address (`srcaddr`). Lines 4 onward are optional `key value`
+Lines 1-3 are, in order, the mode, the remote address (`dstaddr`) and
+the local address (`srcaddr`). Lines 4 onward are optional `key value`
 settings in any order. Everything after `#` is a comment.
 
 EtherIP over IPv4:
 
 ```
 ip4           # mode
-192.0.2.2     # dstaddr (peer address)
+192.0.2.2     # dstaddr (remote address)
 192.0.2.1     # srcaddr (local address)
 ```
 
@@ -176,7 +176,7 @@ EtherIP over IPv6:
 
 ```
 ip6                               # mode
-3ffe::1                           # dstaddr (peer address)
+3ffe::1                           # dstaddr (remote address)
 2001:db8::1                       # srcaddr (local address)
 ```
 
@@ -265,9 +265,9 @@ the same manner as its `check_gpwbpdu.pl`.
 
 ## Limitations and caveats
 
-* Only a single peer is supported (packets whose source/destination IP
-  addresses do not match the configuration are not treated as tunnel
-  packets).
+* Only a single remote endpoint is supported (packets whose source and
+  destination IP addresses do not match the configuration are not
+  treated as tunnel packets).
 * EtherIP has no keepalive or authentication mechanism. If needed,
   substitute something like monitoring the BPDU counters. There is no
   payload checksum either, so error detection relies on the Ethernet
