@@ -80,6 +80,10 @@
 /* The DL port keeps the standard MTU, which bounds the size of the inner frames. */
 #define PE_DL_MTU RTE_ETHER_MTU
 
+/* How long to wait at startup for the links to come up, and the polling interval. */
+#define PE_LINK_WAIT_MS 10000
+#define PE_LINK_POLL_MS 100
+
 /* Maximum number of fragments produced when encapsulating. */
 #define PE_ENCAP_MAX_FRAGS RTE_LIBRTE_IP_FRAG_MAX_FRAG
 
@@ -791,6 +795,47 @@ port_init(uint16_t port, uint16_t mtu)
 		return retval;
 
 	return 0;
+}
+
+/*
+ * Wait up to PE_LINK_WAIT_MS for the links of both ports to come up and report
+ * their state. A link that is still down is only a warning: it may come up
+ * later, but nothing flows on that side until it does.
+ */
+static void
+wait_for_links(void)
+{
+	struct rte_eth_link link_ul = { 0 };
+	struct rte_eth_link link_dl = { 0 };
+	char text[RTE_ETH_LINK_MAX_STR_LEN];
+	int ret_ul, ret_dl, waited = 0;
+
+	for (;;) {
+		/* A PMD that cannot report its link (an error here) is not waited for. */
+		ret_ul = rte_eth_link_get_nowait(port_ul, &link_ul);
+		ret_dl = rte_eth_link_get_nowait(port_dl, &link_dl);
+		if ((ret_ul != 0 || link_ul.link_status == RTE_ETH_LINK_UP)
+				&& (ret_dl != 0 || link_dl.link_status == RTE_ETH_LINK_UP))
+			break;
+		if (waited >= PE_LINK_WAIT_MS)
+			break;
+		rte_delay_ms(PE_LINK_POLL_MS);
+		waited += PE_LINK_POLL_MS;
+	}
+	if (ret_ul == 0)
+		rte_eth_link_to_str(text, sizeof(text), &link_ul);
+	else
+		snprintf(text, sizeof(text), "Link state unknown (%s)", strerror(-ret_ul));
+	printf("Port UL: %s\n", text);
+	if (ret_dl == 0)
+		rte_eth_link_to_str(text, sizeof(text), &link_dl);
+	else
+		snprintf(text, sizeof(text), "Link state unknown (%s)", strerror(-ret_dl));
+	printf("Port DL: %s\n", text);
+	if ((ret_ul == 0 && link_ul.link_status != RTE_ETH_LINK_UP)
+			|| (ret_dl == 0 && link_dl.link_status != RTE_ETH_LINK_UP))
+		printf("Warning: link still down after %d ms; nothing flows on that side until it comes up\n",
+				PE_LINK_WAIT_MS);
 }
 
 /*
@@ -1717,6 +1762,7 @@ main(int argc, char *argv[])
 			port_ul, name_ul, RTE_ETHER_ADDR_BYTES(&ethaddr_ul));
 	printf("Port DL: %"PRIu16" (%s) MAC: %02" PRIx8 " %02" PRIx8 " %02" PRIx8 " %02" PRIx8 " %02" PRIx8 " %02" PRIx8 "\n",
 			port_dl, name_dl, RTE_ETHER_ADDR_BYTES(&ethaddr_dl));
+	wait_for_links();
 
 	init_corks();
 
