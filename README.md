@@ -227,7 +227,14 @@ stats-socket: /run/pestats.socket
 ...
 Port UL: 0 (0000:01:00.0) MAC: ...
 Port DL: 1 (0000:01:00.1) MAC: ...
+Port UL: Link up at 10 Gbps FDX Autoneg
+Port DL: Link up at 1 Gbps FDX Autoneg
 ```
+
+Startup waits up to 10 seconds for both links to come up and reports
+their state; a link that is still down is reported as a warning (the
+application keeps running, but nothing flows on that side until the
+link comes up).
 
 Like ginzado-pseudowire, the application uses three lcores:
 
