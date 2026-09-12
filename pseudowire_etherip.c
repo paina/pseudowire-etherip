@@ -33,6 +33,7 @@
 
 #include <rte_eal.h>
 #include <rte_ethdev.h>
+#include <rte_pci.h>
 #include <rte_cycles.h>
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
@@ -50,6 +51,8 @@
 #define MBUF_CACHE_SIZE 250
 
 #define OPTION_CONFIG "config"
+#define OPTION_UL_PORT "ul-port"
+#define OPTION_DL_PORT "dl-port"
 
 /* EtherIP (RFC 3378) definitions. */
 #define PE_PROTO_ETHERIP 97
@@ -94,8 +97,15 @@ unsigned lcoreid_main = LCORE_ID_ANY;
 unsigned lcoreid_ul = LCORE_ID_ANY;
 unsigned lcoreid_dl = LCORE_ID_ANY;
 
-#define PE_PORT_UL 1
-#define PE_PORT_DL 0
+/*
+ * Ports used as the UL and DL sides, chosen with --ul-port / --dl-port
+ * (see select_ports()). The *_arg strings are the values as given on the
+ * command line, NULL when not given.
+ */
+const char *port_ul_arg = NULL;
+const char *port_dl_arg = NULL;
+uint16_t port_ul = RTE_MAX_ETHPORTS;
+uint16_t port_dl = RTE_MAX_ETHPORTS;
 
 struct rte_ether_addr ethaddr_ul;
 struct rte_ether_addr ethaddr_dl;
@@ -333,7 +343,7 @@ handle_arp(struct rte_mbuf *buf)
 	memcpy(&rep_arp_hdr->arp_data.arp_sip, ip4_srcaddr, 4);
 	memcpy(&rep_arp_hdr->arp_data.arp_tha, &arp_hdr->arp_data.arp_sha, sizeof(struct rte_ether_addr));
 	memcpy(&rep_arp_hdr->arp_data.arp_tip, &arp_hdr->arp_data.arp_sip, 4);
-	const uint16_t nb_tx = rte_eth_tx_burst(PE_PORT_UL, 1, &rep_buf, 1);
+	const uint16_t nb_tx = rte_eth_tx_burst(port_ul, 1, &rep_buf, 1);
 	if (unlikely(nb_tx == 0))
 		rte_pktmbuf_free(rep_buf);
 }
@@ -364,7 +374,7 @@ send_arp_request(void)
 	memcpy(&arp_hdr->arp_data.arp_sip, ip4_srcaddr, 4);
 	memset(&arp_hdr->arp_data.arp_tha, 0, sizeof(struct rte_ether_addr));
 	memcpy(&arp_hdr->arp_data.arp_tip, ip4_dstaddr, 4);
-	const uint16_t nb_tx = rte_eth_tx_burst(PE_PORT_UL, 1, &req_buf, 1);
+	const uint16_t nb_tx = rte_eth_tx_burst(port_ul, 1, &req_buf, 1);
 	if (unlikely(nb_tx == 0))
 		rte_pktmbuf_free(req_buf);
 }
@@ -507,7 +517,7 @@ handle_icmp6_ns(struct rte_mbuf *buf)
 	na_target_linkaddr->icmp6_opt_hdr.opt_len = 1;
 	memcpy(na_target_linkaddr->target_linkaddr, ethaddr_ul.addr_bytes, 6);
 	icmp6_na->icmp6_hdr.cksum = rte_ipv6_udptcp_cksum(na_ip6_hdr, icmp6_na);
-	const uint16_t nb_tx = rte_eth_tx_burst(PE_PORT_UL, 1, &na_buf, 1);
+	const uint16_t nb_tx = rte_eth_tx_burst(port_ul, 1, &na_buf, 1);
 	if (unlikely(nb_tx == 0))
 		rte_pktmbuf_free(na_buf);
 }
@@ -619,7 +629,7 @@ send_ndp_ns(void)
 	opt->icmp6_opt_hdr.opt_len = 1;
 	memcpy(opt->source_linkaddr, ethaddr_ul.addr_bytes, 6);
 	icmp6_ns->icmp6_hdr.cksum = rte_ipv6_udptcp_cksum(ip6_hdr, icmp6_ns);
-	const uint16_t nb_tx = rte_eth_tx_burst(PE_PORT_UL, 1, &ns_buf, 1);
+	const uint16_t nb_tx = rte_eth_tx_burst(port_ul, 1, &ns_buf, 1);
 	if (unlikely(nb_tx == 0))
 		rte_pktmbuf_free(ns_buf);
 }
@@ -666,7 +676,7 @@ send_ndp_rs(void)
 	opt->icmp6_opt_hdr.opt_len = 1;
 	memcpy(opt->source_linkaddr, ethaddr_ul.addr_bytes, 6);
 	icmp6_rs->icmp6_hdr.cksum = rte_ipv6_udptcp_cksum(ip6_hdr, icmp6_rs);
-	const uint16_t nb_tx = rte_eth_tx_burst(PE_PORT_UL, 1, &rs_buf, 1);
+	const uint16_t nb_tx = rte_eth_tx_burst(port_ul, 1, &rs_buf, 1);
 	if (unlikely(nb_tx == 0))
 		rte_pktmbuf_free(rs_buf);
 }
@@ -726,13 +736,13 @@ port_init(uint16_t port)
 	if (retval < 0)
 		return retval;
 
-	if (port == PE_PORT_DL) {
-		retval = rte_eth_macaddr_get(PE_PORT_DL, &ethaddr_dl);
+	if (port == port_dl) {
+		retval = rte_eth_macaddr_get(port_dl, &ethaddr_dl);
 		if (retval != 0)
 			return retval;
 	}
-	if (port == PE_PORT_UL) {
-		retval = rte_eth_macaddr_get(PE_PORT_UL, &ethaddr_ul);
+	if (port == port_ul) {
+		retval = rte_eth_macaddr_get(port_ul, &ethaddr_ul);
 		if (retval != 0)
 			return retval;
 	}
@@ -793,7 +803,7 @@ lcore_ul(__rte_unused void *arg)
 		struct rte_ether_hdr *eth_hdr;
 
 		/* Take one packet from the UL port. */
-		const uint16_t nb_rx = rte_eth_rx_burst(PE_PORT_UL, 0, bufs, 1);
+		const uint16_t nb_rx = rte_eth_rx_burst(port_ul, 0, bufs, 1);
 		/* If no packet was taken, go back to the top of the loop. */
 		if (unlikely(nb_rx == 0))
 			continue;
@@ -923,7 +933,7 @@ lcore_ul(__rte_unused void *arg)
 			pestats.ul_rx_bpdus += 1;
 		const uint64_t txbytes = bufs[0]->pkt_len;
 		/* Send one packet out the DL port. */
-		const uint16_t nb_tx = rte_eth_tx_burst(PE_PORT_DL, 0, bufs, 1);
+		const uint16_t nb_tx = rte_eth_tx_burst(port_dl, 0, bufs, 1);
 		/* If nothing could be sent, drop the packet. */
 		if (unlikely(nb_tx == 0)) {
 			pestats.dl_tx_errors += 1;
@@ -958,7 +968,7 @@ lcore_dl(__rte_unused void *arg)
 		int32_t nb_frags;
 
 		/* Take one packet from the DL port. */
-		const uint16_t nb_rx = rte_eth_rx_burst(PE_PORT_DL, 0, bufs, 1);
+		const uint16_t nb_rx = rte_eth_rx_burst(port_dl, 0, bufs, 1);
 		/* If no packet was taken, go back to the top of the loop. */
 		if (unlikely(nb_rx == 0))
 			continue;
@@ -1103,7 +1113,7 @@ lcore_dl(__rte_unused void *arg)
 			/* Transmit path when no fragmentation was needed: */
 			const uint64_t txbytes = bufs[0]->pkt_len;
 			/* Send one packet out the UL port. */
-			const uint16_t nb_tx = rte_eth_tx_burst(PE_PORT_UL, 0, bufs, 1);
+			const uint16_t nb_tx = rte_eth_tx_burst(port_ul, 0, bufs, 1);
 			/* If nothing could be sent, drop the packet. */
 			if (unlikely(nb_tx == 0)) {
 				pestats.ul_tx_errors += 1;
@@ -1121,7 +1131,7 @@ send_frags:
 			for (i = 0; i < nb_frags; i++)
 				txbytes += frags[i]->pkt_len;
 			/* Send all the fragments out the UL port. */
-			const uint16_t nb_tx = rte_eth_tx_burst(PE_PORT_UL, 0, frags, nb_frags);
+			const uint16_t nb_tx = rte_eth_tx_burst(port_ul, 0, frags, nb_frags);
 			/* If not all of them could be sent, drop the ones that failed. */
 			if (unlikely(nb_tx != nb_frags)) {
 				uint16_t buf;
@@ -1524,12 +1534,99 @@ init_corks(void)
 	}
 }
 
+/*
+ * Resolve a port given on the command line: a port ID, or a device name as
+ * DPDK shows it (e.g. 0000:01:00.0 or net_pcap0). PCI addresses are also
+ * accepted in the shorter forms the EAL accepts (e.g. 01:00.0).
+ */
+static int
+parse_port(const char *str, uint16_t *port)
+{
+	char *endp;
+	unsigned long id;
+	struct rte_pci_addr pci_addr;
+	char name[RTE_ETH_NAME_MAX_LEN];
+
+	if (str[0] == '\0')
+		return -1;
+	if (isdigit((unsigned char)str[0])) {
+		id = strtoul(str, &endp, 10);
+		if (*endp == '\0') {
+			if (id >= RTE_MAX_ETHPORTS || !rte_eth_dev_is_valid_port((uint16_t)id))
+				return -1;
+			*port = (uint16_t)id;
+			return 0;
+		}
+	}
+	if (rte_eth_dev_get_port_by_name(str, port) == 0)
+		return 0;
+	if (rte_pci_addr_parse(str, &pci_addr) == 0) {
+		rte_pci_device_name(&pci_addr, name, sizeof(name));
+		return rte_eth_dev_get_port_by_name(name, port);
+	}
+	return -1;
+}
+
+/*
+ * Decide which port is the UL side and which is the DL side.
+ * Sides not given with --ul-port / --dl-port are filled in from the available
+ * ports, of which there must then be exactly two: with neither given, the
+ * first port is DL and the second is UL; with one given, the other side is
+ * the remaining port. With both given, any other port is left untouched.
+ */
+static int
+select_ports(void)
+{
+	uint16_t ports[2];
+	unsigned nb_ports = 0;
+	uint16_t portid;
+
+	if (port_ul_arg != NULL && parse_port(port_ul_arg, &port_ul) != 0) {
+		printf("Error: UL port not found: %s\n", port_ul_arg);
+		return -1;
+	}
+	if (port_dl_arg != NULL && parse_port(port_dl_arg, &port_dl) != 0) {
+		printf("Error: DL port not found: %s\n", port_dl_arg);
+		return -1;
+	}
+
+	if (port_ul_arg == NULL || port_dl_arg == NULL) {
+		RTE_ETH_FOREACH_DEV(portid) {
+			if (nb_ports < 2)
+				ports[nb_ports] = portid;
+			nb_ports++;
+		}
+		if (nb_ports != 2) {
+			printf("Error: number of ports must be 2 (%u found) unless both "
+					"--"OPTION_UL_PORT" and --"OPTION_DL_PORT" are given\n", nb_ports);
+			return -1;
+		}
+		if (port_ul_arg == NULL && port_dl_arg == NULL) {
+			port_dl = ports[0];
+			port_ul = ports[1];
+		} else if (port_ul_arg == NULL) {
+			port_ul = (ports[0] == port_dl) ? ports[1] : ports[0];
+		} else {
+			port_dl = (ports[0] == port_ul) ? ports[1] : ports[0];
+		}
+	}
+
+	if (port_ul == port_dl) {
+		printf("Error: UL and DL ports must differ\n");
+		return -1;
+	}
+	return 0;
+}
+
 static void
 print_usage(const char *prgname)
 {
 	printf("%s usage:\n", prgname);
-	printf("[EAL options] --  --"OPTION_CONFIG"=FILE: ");
-	printf("specify the configuration file.\n");
+	printf("[EAL options] -- --"OPTION_CONFIG"=FILE [--"OPTION_UL_PORT"=PORT] [--"OPTION_DL_PORT"=PORT]\n");
+	printf("  --"OPTION_CONFIG"=FILE   configuration file\n");
+	printf("  --"OPTION_UL_PORT"=PORT  port used as the UL side (default: the second port)\n");
+	printf("  --"OPTION_DL_PORT"=PORT  port used as the DL side (default: the first port)\n");
+	printf("PORT is a port ID or a device name (e.g. 0000:01:00.0 or net_pcap0).\n");
 }
 
 static int
@@ -1541,6 +1638,8 @@ parse_args(int argc, char **argv)
 	char *prgname = argv[0];
 	static struct option lgopts[] = {
 		{OPTION_CONFIG, 1, 0, 0},
+		{OPTION_UL_PORT, 1, 0, 0},
+		{OPTION_DL_PORT, 1, 0, 0},
 		{NULL, 0, 0, 0},
 	};
 
@@ -1551,6 +1650,10 @@ parse_args(int argc, char **argv)
 		case 0:
 			if (!strncmp(lgopts[option_index].name, OPTION_CONFIG, sizeof(OPTION_CONFIG)))
 				config = optarg;
+			else if (!strncmp(lgopts[option_index].name, OPTION_UL_PORT, sizeof(OPTION_UL_PORT)))
+				port_ul_arg = optarg;
+			else if (!strncmp(lgopts[option_index].name, OPTION_DL_PORT, sizeof(OPTION_DL_PORT)))
+				port_dl_arg = optarg;
 			break;
 		default:
 			print_usage(prgname);
@@ -1585,9 +1688,9 @@ sighup_handler(int signum)
 int
 main(int argc, char *argv[])
 {
-	unsigned nb_ports;
-	uint16_t portid;
 	unsigned lcoreid;
+	char name_ul[RTE_ETH_NAME_MAX_LEN];
+	char name_dl[RTE_ETH_NAME_MAX_LEN];
 	uint64_t frag_cycles;
 
 	signal(SIGHUP, sighup_handler);
@@ -1606,9 +1709,8 @@ main(int argc, char *argv[])
 	if (rte_lcore_count() != 3)
 		rte_exit(EXIT_FAILURE, "Error: number of lcores must be 3\n");
 
-	nb_ports = rte_eth_dev_count_avail();
-	if (nb_ports != 2)
-		rte_exit(EXIT_FAILURE, "Error: number of ports must be 2\n");
+	if (select_ports() < 0)
+		rte_exit(EXIT_FAILURE, "Error: port selection failed\n");
 
 	if (config == NULL)
 		rte_exit(EXIT_FAILURE, "Error: config file not specified\n");
@@ -1626,7 +1728,7 @@ main(int argc, char *argv[])
 	if (ring_dl2main == NULL)
 		rte_exit(EXIT_FAILURE, "Error: dl2main ring create failed\n");
 
-	mbuf_pool = rte_pktmbuf_pool_create("MBUF_POOL", NUM_MBUFS * nb_ports,
+	mbuf_pool = rte_pktmbuf_pool_create("MBUF_POOL", NUM_MBUFS * 2 /* UL and DL */,
 		MBUF_CACHE_SIZE, 0, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
 	if (mbuf_pool == NULL)
 		rte_exit(EXIT_FAILURE, "Cannot create mbuf pool\n");
@@ -1645,14 +1747,19 @@ main(int argc, char *argv[])
 	if (frag_tbl == NULL)
 		rte_exit(EXIT_FAILURE, "Cannot create fragment reassembly table\n");
 
-	RTE_ETH_FOREACH_DEV(portid)
-		if (port_init(portid) != 0)
-			rte_exit(EXIT_FAILURE, "Cannot init port %"PRIu16 "\n", portid);
+	if (port_init(port_dl) != 0)
+		rte_exit(EXIT_FAILURE, "Cannot init DL port %"PRIu16 "\n", port_dl);
+	if (port_init(port_ul) != 0)
+		rte_exit(EXIT_FAILURE, "Cannot init UL port %"PRIu16 "\n", port_ul);
 
-	printf("Port UL MAC: %02" PRIx8 " %02" PRIx8 " %02" PRIx8 " %02" PRIx8 " %02" PRIx8 " %02" PRIx8 "\n",
-			RTE_ETHER_ADDR_BYTES(&ethaddr_ul));
-	printf("Port DL MAC: %02" PRIx8 " %02" PRIx8 " %02" PRIx8 " %02" PRIx8 " %02" PRIx8 " %02" PRIx8 "\n",
-			RTE_ETHER_ADDR_BYTES(&ethaddr_dl));
+	if (rte_eth_dev_get_name_by_port(port_ul, name_ul) != 0)
+		strcpy(name_ul, "?");
+	if (rte_eth_dev_get_name_by_port(port_dl, name_dl) != 0)
+		strcpy(name_dl, "?");
+	printf("Port UL: %"PRIu16" (%s) MAC: %02" PRIx8 " %02" PRIx8 " %02" PRIx8 " %02" PRIx8 " %02" PRIx8 " %02" PRIx8 "\n",
+			port_ul, name_ul, RTE_ETHER_ADDR_BYTES(&ethaddr_ul));
+	printf("Port DL: %"PRIu16" (%s) MAC: %02" PRIx8 " %02" PRIx8 " %02" PRIx8 " %02" PRIx8 " %02" PRIx8 " %02" PRIx8 "\n",
+			port_dl, name_dl, RTE_ETHER_ADDR_BYTES(&ethaddr_dl));
 
 	init_corks();
 
