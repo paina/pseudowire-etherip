@@ -156,14 +156,24 @@ $ cc $(pkg-config --cflags libdpdk) -DALLOW_EXPERIMENTAL_API \
 Set up hugepages and bind the NICs, as for any DPDK application:
 
 ```
-% sudo mkdir /dev/hugepages # if needed
 % sudo sh -c 'echo 64 > /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages'
-% sudo modprobe uio_pci_generic
-% sudo dpdk-devbind.py -u 0000:01:00.0
-% sudo dpdk-devbind.py -u 0000:01:00.1
-% sudo dpdk-devbind.py -b uio_pci_generic 0000:01:00.0
-% sudo dpdk-devbind.py -b uio_pci_generic 0000:01:00.1
+% sudo modprobe vfio-pci
+% sudo dpdk-devbind.py -u 0000:01:00.0 0000:01:00.1
+% sudo dpdk-devbind.py -b vfio-pci 0000:01:00.0 0000:01:00.1
 ```
+
+64 hugepages of 2 MB are enough for the application itself (it uses
+about 60 MB); `dpdk-testpmd` wants more by default, so give it
+`--total-num-mbufs=16384` or more hugepages. Current distributions
+mount `/dev/hugepages` automatically.
+
+`vfio-pci` needs the IOMMU (Intel VT-d or AMD-Vi) to be enabled. With
+`uio_pci_generic` on a host whose IOMMU is enabled, the NIC's DMA is
+silently blocked: the application starts and reports the links up, but
+no packet ever flows, and `dmesg` shows `DMAR: ... PTE Read access is
+not set` faults. On a host without an IOMMU, either use
+`uio_pci_generic` or enable the no-IOMMU mode of vfio
+(`echo 1 | sudo tee /sys/module/vfio/parameters/enable_unsafe_noiommu_mode`).
 
 The application uses two ports: the DL side (raw Ethernet frames) and
 the UL side (EtherIP packets). Which port plays which role is chosen
