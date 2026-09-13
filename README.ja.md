@@ -96,8 +96,8 @@ $ meson compile -C build
 
 ```
 $ cc $(pkg-config --cflags libdpdk) -DALLOW_EXPERIMENTAL_API \
-	-o dpdk-pseudowire-etherip pseudowire_etherip.c \
-	$(pkg-config --libs libdpdk)
+    -o dpdk-pseudowire-etherip pseudowire_etherip.c \
+    $(pkg-config --libs libdpdk)
 ```
 
 ## 使い方
@@ -149,15 +149,15 @@ $ sudo ./dpdk-pseudowire-etherip -l 1-3 -- --remote 192.0.2.2 --local 192.0.2.1
 EtherIP over IPv6 で，静的なネクストホップを指定し，2 つのポートの役割を入れ替えた例:
 
 ```
-$ sudo ./dpdk-pseudowire-etherip -l 1-3 -- --remote 2001:db8:1::1 --local 2001:db8::1 \
-	--nexthop-mac 00:1a:2b:3c:4d:5e --ul-port 0000:01:00.0
+$ sudo ./dpdk-pseudowire-etherip -l 1-3 -- --remote 3fff::1 --local 2001:db8::1 \
+    --nexthop-mac 00:1a:2b:3c:4d:5e --ul-port 0000:01:00.0
 ```
 
 有効な設定と実際に選ばれたポートは，起動時に表示されます。
 
 ```
 mode: EtherIP over IPv6
-remote: 2001:db8:1::1
+remote: 3fff::1
 local: 2001:db8::1
 mtu: 1500
 nexthop-mac: 00:1A:2B:3C:4D:5E
