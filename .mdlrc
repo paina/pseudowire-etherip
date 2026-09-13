@@ -1,0 +1,7 @@
+# Configuration for mdl (the "markdownlint" Debian package): mdl README.md README.ja.md
+#
+# MD013 (line length): README.ja.md keeps each paragraph on one line, since a
+# line break inside Japanese text may render as a space.
+# MD014 (dollar signs before commands): the "$ " prompt is kept on purpose to
+# tell commands from their output.
+rules "~MD013,~MD014"
