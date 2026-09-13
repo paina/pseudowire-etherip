@@ -1,5 +1,7 @@
 # pseudowire-etherip
 
+[English](README.md) | [日本語](README.ja.md)
+
 A DPDK application that extends an L2 segment over EtherIP (RFC 3378)
 tunnels, over either IPv4 or IPv6.
 
