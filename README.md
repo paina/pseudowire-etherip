@@ -10,6 +10,9 @@ end therefore does not have to be this application: any implementation
 that speaks EtherIP (the gif/etherip interfaces of BSD-derived operating
 systems, router products from various vendors, ...) will interoperate.
 
+Two modes are supported, selected by the address family of the tunnel
+endpoint addresses:
+
 * EtherIP over IPv4
 * EtherIP over IPv6
 
@@ -47,21 +50,21 @@ The headers prepended on encapsulation are:
 
 ### EtherIP over IPv4
 
-| Header                  |    Size |
-|:------------------------|--------:|
-| Outer Ethernet header   | 14 byte |
-| Outer IPv4 header       | 20 byte |
-| EtherIP header          |  2 byte |
-| Original Ethernet frame |         |
+| Header                  |     Size |
+|:------------------------|---------:|
+| Outer Ethernet header   | 14 bytes |
+| Outer IPv4 header       | 20 bytes |
+| EtherIP header          |  2 bytes |
+| Original Ethernet frame |          |
 
 ### EtherIP over IPv6
 
-| Header                  |    Size |
-|:------------------------|--------:|
-| Outer Ethernet header   | 14 byte |
-| Outer IPv6 header       | 40 byte |
-| EtherIP header          |  2 byte |
-| Original Ethernet frame |         |
+| Header                  |     Size |
+|:------------------------|---------:|
+| Outer Ethernet header   | 14 bytes |
+| Outer IPv6 header       | 40 bytes |
+| EtherIP header          |  2 bytes |
+| Original Ethernet frame |          |
 
 The EtherIP header is 16 bits: the top 4 bits are the version (3) and
 the remaining 12 bits are reserved (0), i.e. a fixed `0x3000`. The outer
@@ -73,8 +76,9 @@ required by RFC 3378).
 ## Fragmentation and MTU
 
 If an encapsulated packet exceeds the UL-side MTU (`--mtu`, default
-1500), it is split with standard IP fragmentation before transmission. Fragmented packets received on the UL side are reassembled
-before decapsulation.
+1500), it is split with standard IP fragmentation before transmission.
+Fragmented packets received on the UL side are reassembled before
+decapsulation.
 
 When passing an inner MTU of 1500 (1514-byte frames) through an outer
 MTU of 1500, every full-sized frame is split in two. If the outer path
@@ -88,8 +92,8 @@ lets such frames through as-is.
 The UL port is configured with `--mtu` as its MTU, so the NIC and its
 PMD must support that size (and, above what fits in one 2048-byte mbuf,
 scattered receive). The DL port keeps the standard MTU of 1500, which
-bounds the inner frame size as before; larger inner frames are not
-accepted on the DL side.
+bounds the inner frame size as in ginzado-pseudowire; larger inner
+frames are not accepted on the DL side.
 
 Reassembly has the following constraints (from `librte_ip_frag` and this
 implementation):
@@ -113,8 +117,8 @@ received on the DL side are discarded until it is resolved.
   the answer is learned. ARP requests for the local address are
   answered. (This assumes the remote end is on-link; if it is off-link,
   specify the gateway's MAC address with `--nexthop-mac`.)
-* IPv6: an NS and an RS for the remote address are sent every second
-  and NAs are learned (when the remote end is on-link). As in
+* IPv6: an NS for the remote address and an RS are sent every second,
+  and the NA is learned (when the remote end is on-link). As in
   ginzado-pseudowire, when an RA advertising the same prefix as the
   local address is received, the MAC address of its sender (the router)
   is learned (for cases like the NTT FLET'S folded-back connectivity
@@ -145,8 +149,8 @@ installed DPDK, like any other out-of-tree DPDK application:
 
 ```
 $ cc $(pkg-config --cflags libdpdk) -DALLOW_EXPERIMENTAL_API \
-	-o dpdk-pseudowire-etherip pseudowire_etherip.c \
-	$(pkg-config --libs libdpdk)
+    -o dpdk-pseudowire-etherip pseudowire_etherip.c \
+    $(pkg-config --libs libdpdk)
 ```
 
 ## Usage
@@ -156,10 +160,10 @@ $ cc $(pkg-config --cflags libdpdk) -DALLOW_EXPERIMENTAL_API \
 Set up hugepages and bind the NICs, as for any DPDK application:
 
 ```
-% sudo sh -c 'echo 64 > /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages'
-% sudo modprobe vfio-pci
-% sudo dpdk-devbind.py -u 0000:01:00.0 0000:01:00.1
-% sudo dpdk-devbind.py -b vfio-pci 0000:01:00.0 0000:01:00.1
+$ sudo sh -c 'echo 64 > /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages'
+$ sudo modprobe vfio-pci
+$ sudo dpdk-devbind.py -u 0000:01:00.0 0000:01:00.1
+$ sudo dpdk-devbind.py -b vfio-pci 0000:01:00.0 0000:01:00.1
 ```
 
 64 hugepages of 2 MB are enough for the application itself (it uses
@@ -193,7 +197,7 @@ Application options follow the EAL options and `--`:
 | `--stats-socket=PATH` | Statistics socket path (default `/run/pestats.socket`)             |
 | `--ul-port=PORT`      | Port used as the UL side                                           |
 | `--dl-port=PORT`      | Port used as the DL side                                           |
-| `--help`              | Print the usage and exit                                           |
+| `-h`, `--help`        | Print the usage and exit                                           |
 
 `--remote` and `--local` are the tunnel endpoint addresses: the
 destination and source addresses of the outer IP header of the packets
@@ -201,7 +205,8 @@ this side sends (the remote end is the "remote EtherIP station" of
 RFC 3378). Both must be IPv4 or both IPv6, which selects EtherIP over
 IPv4 or over IPv6. As in ginzado-pseudowire, they may also be written
 as plain hex strings without separators (8 digits for IPv4, 32 for
-IPv6).
+IPv6). `--nexthop-mac` likewise accepts 12 hex digits, with `:` or `-`
+separators or none.
 
 `PORT` is a DPDK port ID or a device name: a PCI address
 (`0000:01:00.1`, or the shorter `01:00.1`) or a vdev name (`net_pcap1`).
@@ -223,8 +228,8 @@ EtherIP over IPv6, with a static next hop and the roles of the two
 ports swapped:
 
 ```
-$ sudo ./dpdk-pseudowire-etherip -l 1-3 -- --remote 3ffe::1 --local 2001:db8::1 \
-	--nexthop-mac 00:1a:2b:3c:4d:5e --ul-port 0000:01:00.0
+$ sudo ./dpdk-pseudowire-etherip -l 1-3 -- --remote 3fff::1 --local 2001:db8::1 \
+    --nexthop-mac 00:1a:2b:3c:4d:5e --ul-port 0000:01:00.0
 ```
 
 The settings in effect and the ports actually chosen are printed at
@@ -232,7 +237,7 @@ startup:
 
 ```
 mode: EtherIP over IPv6
-remote: 3ffe::1
+remote: 3fff::1
 local: 2001:db8::1
 mtu: 1500
 nexthop-mac: 00:1A:2B:3C:4D:5E
@@ -249,7 +254,8 @@ their state; a link that is still down is reported as a warning (the
 application keeps running, but nothing flows on that side until the
 link comes up).
 
-Like ginzado-pseudowire, the application uses three lcores:
+Like ginzado-pseudowire, the application needs exactly three lcores
+(hence `-l 1-3` above):
 
 * a loop handling packets received on the UL port (`lcore_ul`)
 * a loop handling frames received on the DL port (`lcore_dl`)
@@ -318,6 +324,13 @@ of free memory; each scenario takes a few seconds.
   FCS, as with ginzado-pseudowire.
 * Outer IPv6 packets carrying other extension headers are not handled.
 * The three lcores busy-poll at all times.
+
+## AI assistance
+
+This program and its documentation were written with the assistance of
+generative AI coding agents, such as Claude Code. Their output has been
+reviewed and tested by the author. Commits made with their help carry
+an `Assisted-by:` trailer naming the agent and the model.
 
 ## License
 
